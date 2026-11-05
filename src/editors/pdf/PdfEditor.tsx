@@ -1,0 +1,551 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import * as pdfjs from 'pdfjs-dist';
+import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
+import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import { OpenedFile, pickFile, saveFile } from '../../lib/fileio';
+import { Annot, applyAnnotations, deletePage, insertBlankPage, mergePdf, movePage, rotatePage } from './pdfOps';
+import { SignaturePad } from './SignaturePad';
+import { EditorShell, ToolButton, Sep } from '../../components/EditorShell';
+import { uid } from '../../lib/uid';
+
+pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
+
+// Phông chữ dùng khi xem trước chữ chèn vào PDF, trùng với phông được nhúng khi lưu (hỗ trợ tiếng Việt).
+if (typeof FontFace !== 'undefined') {
+  const face = new FontFace('DejaVu Sans', `url(${new URL('fonts/DejaVuSans.ttf', document.baseURI).href})`);
+  face.load().then((f) => document.fonts.add(f)).catch(() => {});
+}
+
+type Tool = 'select' | 'text' | 'highlight' | 'rect' | 'whiteout' | 'ink' | 'place';
+type Size = { w: number; h: number };
+
+interface Snapshot { bytes: Uint8Array; annots: Annot[] }
+
+const TOOLS: { id: Tool; label: string; icon: string; hint: string }[] = [
+  { id: 'select', label: 'Chọn', icon: '↖', hint: 'Chọn, kéo để di chuyển, Delete để xoá' },
+  { id: 'text', label: 'Chữ', icon: 'T', hint: 'Bấm vào trang để thêm chữ' },
+  { id: 'highlight', label: 'Tô sáng', icon: '▮', hint: 'Kéo để tô sáng' },
+  { id: 'rect', label: 'Khung', icon: '▭', hint: 'Kéo để vẽ khung' },
+  { id: 'whiteout', label: 'Che trắng', icon: '⬜', hint: 'Kéo để che nội dung cũ, rồi gõ chữ mới lên' },
+  { id: 'ink', label: 'Bút vẽ', icon: '✎', hint: 'Kéo để vẽ tự do' },
+];
+
+export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose: () => void }) {
+  const [bytes, setBytes] = useState(() => new Uint8Array(file.data));
+  const [doc, setDoc] = useState<PDFDocumentProxy | null>(null);
+  const [sizes, setSizes] = useState<Size[]>([]);
+  const [annots, setAnnots] = useState<Annot[]>([]);
+  const [history, setHistory] = useState<Snapshot[]>([]);
+  const [future, setFuture] = useState<Snapshot[]>([]);
+  const [tool, setTool] = useState<Tool>('select');
+  const [color, setColor] = useState('#d1242f');
+  const [fontSize, setFontSize] = useState(14);
+  const [zoom, setZoom] = useState(1.2);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [pending, setPending] = useState<{ dataUrl: string; w: number; h: number } | null>(null);
+  const [showSign, setShowSign] = useState(false);
+  const [showThumbs, setShowThumbs] = useState(() => window.innerWidth > 800);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const [path, setPath] = useState(file.path);
+  const [query, setQuery] = useState('');
+  const [hits, setHits] = useState<number[] | null>(null);
+  const [hitIdx, setHitIdx] = useState(0);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Nạp tài liệu vào pdf.js mỗi khi nội dung thay đổi.
+  useEffect(() => {
+    let cancelled = false;
+    const task = pdfjs.getDocument({ data: bytes.slice() });
+    task.promise
+      .then(async (d) => {
+        const s: Size[] = [];
+        for (let i = 1; i <= d.numPages; i++) {
+          const vp = (await d.getPage(i)).getViewport({ scale: 1 });
+          s.push({ w: vp.width, h: vp.height });
+        }
+        if (cancelled) return d.destroy();
+        setSizes(s);
+        setDoc((old) => {
+          old?.destroy();
+          return d;
+        });
+      })
+      .catch((e) => !cancelled && setError(`Không mở được PDF: ${e.message ?? e}`));
+    return () => {
+      cancelled = true;
+    };
+  }, [bytes]);
+
+  const snapshot = useCallback(() => {
+    setHistory((h) => [...h.slice(-29), { bytes, annots }]);
+    setFuture([]);
+    setDirty(true);
+  }, [bytes, annots]);
+
+  const undo = () => {
+    const last = history[history.length - 1];
+    if (!last) return;
+    setFuture((f) => [{ bytes, annots }, ...f]);
+    setHistory((h) => h.slice(0, -1));
+    if (last.bytes !== bytes) setBytes(last.bytes);
+    setAnnots(last.annots);
+  };
+  const redo = () => {
+    const next = future[0];
+    if (!next) return;
+    setHistory((h) => [...h, { bytes, annots }]);
+    setFuture((f) => f.slice(1));
+    if (next.bytes !== bytes) setBytes(next.bytes);
+    setAnnots(next.annots);
+  };
+
+  const run = async (label: string, fn: () => Promise<void>) => {
+    setBusy(label);
+    setError(null);
+    try {
+      await fn();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  /** Thao tác trang: làm phẳng chú thích hiện có trước rồi mới biến đổi trang. */
+  const pageOp = (label: string, op: (b: Uint8Array) => Promise<Uint8Array>) =>
+    run(label, async () => {
+      const flat = annots.length ? await applyAnnotations(bytes, annots) : bytes;
+      const out = await op(flat);
+      snapshot();
+      setAnnots([]);
+      setSelected(null);
+      setBytes(out);
+    });
+
+  const save = (saveAs = false) =>
+    run('Đang lưu…', async () => {
+      const out = await applyAnnotations(bytes, annots);
+      const p = await saveFile({ name: file.name, kind: 'pdf', path }, out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer, saveAs);
+      if (p) setPath(p);
+      setDirty(false);
+    });
+
+  const updateAnnot = (id: string, patch: Partial<Annot>, record = false) => {
+    if (record) snapshot();
+    setAnnots((list) => list.map((a) => (a.id === id ? ({ ...a, ...patch } as Annot) : a)));
+  };
+  const addAnnot = (a: Annot) => {
+    snapshot();
+    setAnnots((list) => [...list, a]);
+  };
+  const removeSelected = () => {
+    if (!selected) return;
+    snapshot();
+    setAnnots((list) => list.filter((a) => a.id !== selected));
+    setSelected(null);
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const typing = (e.target as HTMLElement).closest('textarea,input');
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); save(); }
+      else if (typing) return;
+      else if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); }
+      else if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); }
+      else if ((e.key === 'Delete' || e.key === 'Backspace') && selected) { e.preventDefault(); removeSelected(); }
+      else if (e.key === 'Escape') { setSelected(null); setPending(null); setTool('select'); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  const scrollToPage = (i: number) => {
+    scrollRef.current?.querySelector(`[data-page="${i}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  const search = async () => {
+    if (!doc || !query.trim()) return setHits(null);
+    const q = query.trim().toLowerCase();
+    const found: number[] = [];
+    for (let i = 1; i <= doc.numPages; i++) {
+      const tc = await (await doc.getPage(i)).getTextContent();
+      const text = tc.items.map((it) => ('str' in it ? it.str : '')).join(' ').toLowerCase();
+      if (text.includes(q)) found.push(i - 1);
+    }
+    setHits(found);
+    setHitIdx(0);
+    if (found.length) scrollToPage(found[0]);
+  };
+
+  const pickImage = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/png,image/jpeg';
+    input.onchange = () => {
+      const f = input.files?.[0];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        const img = new Image();
+        img.onload = () => {
+          const w = Math.min(220, img.width);
+          setPending({ dataUrl, w, h: (img.height / img.width) * w });
+          setTool('place');
+        };
+        img.src = dataUrl;
+      };
+      reader.readAsDataURL(f);
+    };
+    input.click();
+  };
+
+  const selAnnot = annots.find((a) => a.id === selected);
+  const hint = tool === 'place' ? 'Bấm vào trang để đặt ảnh/chữ ký' : TOOLS.find((t) => t.id === tool)?.hint;
+
+  return (
+    <EditorShell
+      kind="pdf"
+      title={file.name}
+      dirty={dirty}
+      onClose={onClose}
+      onSave={() => save()}
+      onSaveAs={() => save(true)}
+      busy={busy}
+      error={error}
+      onDismissError={() => setError(null)}
+      toolbar={
+        <>
+          <ToolButton icon="↶" label="Hoàn tác" onClick={undo} disabled={!history.length} />
+          <ToolButton icon="↷" label="Làm lại" onClick={redo} disabled={!future.length} />
+          <Sep />
+          {TOOLS.map((t) => (
+            <ToolButton key={t.id} icon={t.icon} label={t.label} active={tool === t.id} onClick={() => { setTool(t.id); setPending(null); }} />
+          ))}
+          <ToolButton icon="✍" label="Chữ ký" onClick={() => setShowSign(true)} active={tool === 'place' && !!pending} />
+          <ToolButton icon="🖼" label="Ảnh" onClick={pickImage} />
+          <Sep />
+          <label className="tb-field" title="Màu">
+            <input type="color" value={color} onChange={(e) => {
+              setColor(e.target.value);
+              if (selAnnot && 'color' in selAnnot) updateAnnot(selAnnot.id, { color: e.target.value }, true);
+            }} />
+          </label>
+          <label className="tb-field" title="Cỡ chữ">
+            <select value={fontSize} onChange={(e) => {
+              const v = Number(e.target.value);
+              setFontSize(v);
+              if (selAnnot?.type === 'text') updateAnnot(selAnnot.id, { size: v }, true);
+            }}>
+              {[8, 10, 11, 12, 14, 16, 18, 24, 32, 48].map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </label>
+          {selected && <ToolButton icon="🗑" label="Xoá" onClick={removeSelected} />}
+          <Sep />
+          <ToolButton icon="−" label="Thu nhỏ" onClick={() => setZoom((z) => Math.max(0.4, +(z - 0.2).toFixed(2)))} />
+          <span className="tb-zoom">{Math.round(zoom * 100)}%</span>
+          <ToolButton icon="+" label="Phóng to" onClick={() => setZoom((z) => Math.min(4, +(z + 0.2).toFixed(2)))} />
+          <ToolButton icon="⇔" label="Vừa khung" onClick={() => {
+            const w = scrollRef.current?.clientWidth ?? 800;
+            const maxW = Math.max(...sizes.map((s) => s.w), 1);
+            setZoom(+((w - 40) / maxW).toFixed(2));
+          }} />
+          <Sep />
+          <ToolButton icon="▤" label="Trang" active={showThumbs} onClick={() => setShowThumbs((v) => !v)} />
+          <ToolButton icon="⊕" label="Gộp PDF" onClick={() => run('Đang gộp…', async () => {
+            const other = await pickFile();
+            if (!other) return;
+            if (other.kind !== 'pdf') throw new Error('Hãy chọn một tệp PDF để gộp.');
+            await pageOp('Đang gộp…', (b) => mergePdf(b, new Uint8Array(other.data)));
+          })} />
+          <form className="tb-search" onSubmit={(e) => { e.preventDefault(); search(); }}>
+            <input placeholder="Tìm trong PDF…" value={query} onChange={(e) => setQuery(e.target.value)} />
+            {hits && (
+              <button type="button" className="tb-hits" onClick={() => {
+                if (!hits.length) return;
+                const n = (hitIdx + 1) % hits.length;
+                setHitIdx(n);
+                scrollToPage(hits[n]);
+              }}>
+                {hits.length ? `Trang ${hits[hitIdx] + 1} (${hitIdx + 1}/${hits.length}) ›` : 'Không thấy'}
+              </button>
+            )}
+          </form>
+        </>
+      }
+      status={`${sizes.length} trang · ${hint ?? ''}`}
+    >
+      <div className="pdf-body">
+        {showThumbs && doc && (
+          <aside className="pdf-thumbs">
+            {sizes.map((s, i) => (
+              <div key={i} className="thumb">
+                <button className="thumb-img" onClick={() => scrollToPage(i)} title={`Trang ${i + 1}`}>
+                  <PdfCanvas doc={doc} index={i} zoom={110 / s.w} size={s} />
+                </button>
+                <div className="thumb-actions">
+                  <span>{i + 1}</span>
+                  <button title="Xoay trái" onClick={() => pageOp('Đang xoay…', (b) => rotatePage(b, i, -90))}>⟲</button>
+                  <button title="Xoay phải" onClick={() => pageOp('Đang xoay…', (b) => rotatePage(b, i, 90))}>⟳</button>
+                  <button title="Lên" disabled={i === 0} onClick={() => pageOp('Đang di chuyển…', (b) => movePage(b, i, i - 1))}>↑</button>
+                  <button title="Xuống" disabled={i === sizes.length - 1} onClick={() => pageOp('Đang di chuyển…', (b) => movePage(b, i, i + 1))}>↓</button>
+                  <button title="Chèn trang trắng phía sau" onClick={() => pageOp('Đang chèn…', (b) => insertBlankPage(b, i + 1))}>＋</button>
+                  <button title="Xoá trang" onClick={() => {
+                    if (confirm(`Xoá trang ${i + 1}?`)) pageOp('Đang xoá…', (b) => deletePage(b, i));
+                  }}>✕</button>
+                </div>
+              </div>
+            ))}
+          </aside>
+        )}
+        <div className="pdf-scroll" ref={scrollRef} onPointerDown={(e) => { if (e.target === e.currentTarget) setSelected(null); }}>
+          {!doc && !error && <div className="loading">Đang mở tài liệu…</div>}
+          {doc && sizes.map((s, i) => (
+            <div key={i} className="pdf-page" data-page={i} style={{ width: s.w * zoom, height: s.h * zoom }}>
+              <PdfCanvas doc={doc} index={i} zoom={zoom} size={s} />
+              <AnnotLayer
+                page={i}
+                size={s}
+                zoom={zoom}
+                tool={tool}
+                color={color}
+                fontSize={fontSize}
+                annots={annots}
+                selected={selected}
+                pending={pending}
+                onSelect={setSelected}
+                onAdd={(a) => { addAnnot(a); setSelected(a.id); if (a.type === 'image') { setPending(null); setTool('select'); } if (a.type === 'text') setTool('select'); }}
+                onUpdate={updateAnnot}
+                onBeginChange={snapshot}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+      {showSign && (
+        <SignaturePad
+          onCancel={() => setShowSign(false)}
+          onDone={(dataUrl, w, h) => {
+            setShowSign(false);
+            setPending({ dataUrl, w, h });
+            setTool('place');
+          }}
+        />
+      )}
+    </EditorShell>
+  );
+}
+
+/** Vẽ một trang PDF lên canvas khi trang xuất hiện trong khung nhìn. */
+function PdfCanvas({ doc, index, zoom, size }: { doc: PDFDocumentProxy; index: number; zoom: number; size: Size }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const io = new IntersectionObserver(([e]) => e.isIntersecting && setVisible(true), { rootMargin: '600px' });
+    io.observe(el);
+    return () => io.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!visible) return;
+    let task: RenderTask | null = null;
+    let cancelled = false;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    doc.getPage(index + 1).then((page) => {
+      if (cancelled || !ref.current) return;
+      const vp = page.getViewport({ scale: zoom * dpr });
+      const canvas = ref.current;
+      canvas.width = Math.floor(vp.width);
+      canvas.height = Math.floor(vp.height);
+      task = page.render({ canvasContext: canvas.getContext('2d')!, viewport: vp });
+      task.promise.catch(() => {});
+    });
+    return () => {
+      cancelled = true;
+      task?.cancel();
+    };
+  }, [doc, index, zoom, visible]);
+
+  return <canvas ref={ref} className="pdf-canvas" style={{ width: size.w * zoom, height: size.h * zoom }} />;
+}
+
+interface LayerProps {
+  page: number; size: Size; zoom: number; tool: Tool; color: string; fontSize: number;
+  annots: Annot[]; selected: string | null; pending: { dataUrl: string; w: number; h: number } | null;
+  onSelect(id: string | null): void; onAdd(a: Annot): void;
+  onUpdate(id: string, patch: Partial<Annot>, record?: boolean): void; onBeginChange(): void;
+}
+
+function AnnotLayer(p: LayerProps) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [draft, setDraft] = useState<Annot | null>(null);
+  const drag = useRef<{ id: string; sx: number; sy: number; orig: Annot; mode: 'move' | 'resize'; moved: boolean } | null>(null);
+  const mine = useMemo(() => p.annots.filter((a) => a.page === p.page), [p.annots, p.page]);
+
+  const pt = (e: React.PointerEvent): [number, number] => {
+    const r = ref.current!.getBoundingClientRect();
+    return [(e.clientX - r.left) / p.zoom, (e.clientY - r.top) / p.zoom];
+  };
+
+  const onDown = (e: React.PointerEvent) => {
+    if (e.button !== 0) return;
+    const [x, y] = pt(e);
+    const target = (e.target as HTMLElement).closest('[data-annot]') as HTMLElement | null;
+    if (p.tool === 'select') {
+      if (!target) return p.onSelect(null);
+      const id = target.dataset.annot!;
+      const orig = p.annots.find((a) => a.id === id)!;
+      p.onSelect(id);
+      if ((e.target as HTMLElement).tagName === 'TEXTAREA') return;
+      drag.current = { id, sx: x, sy: y, orig, mode: (e.target as HTMLElement).dataset.handle ? 'resize' : 'move', moved: false };
+      ref.current!.setPointerCapture(e.pointerId);
+      return;
+    }
+    e.preventDefault();
+    if (p.tool === 'text') {
+      p.onAdd({ id: uid(), page: p.page, type: 'text', x, y: y - p.fontSize * 0.6, text: '', size: p.fontSize, color: p.color });
+      return;
+    }
+    if (p.tool === 'place' && p.pending) {
+      const { dataUrl, w, h } = p.pending;
+      p.onAdd({ id: uid(), page: p.page, type: 'image', x: x - w / 2, y: y - h / 2, w, h, dataUrl });
+      return;
+    }
+    ref.current!.setPointerCapture(e.pointerId);
+    if (p.tool === 'ink') setDraft({ id: uid(), page: p.page, type: 'ink', points: [[x, y]], color: p.color, width: 2 });
+    else if (p.tool === 'highlight' || p.tool === 'rect' || p.tool === 'whiteout')
+      setDraft({ id: uid(), page: p.page, type: p.tool, x, y, w: 0, h: 0, color: p.tool === 'highlight' ? '#ffd400' : p.color, ...{ ox: x, oy: y } } as Annot);
+  };
+
+  const onMove = (e: React.PointerEvent) => {
+    const [x, y] = pt(e);
+    if (drag.current) {
+      const d = drag.current;
+      const dx = x - d.sx, dy = y - d.sy;
+      if (!d.moved) {
+        if (Math.abs(dx) + Math.abs(dy) < 2) return;
+        d.moved = true;
+        p.onBeginChange();
+      }
+      const o = d.orig;
+      if (d.mode === 'resize' && 'w' in o) {
+        p.onUpdate(o.id, { w: Math.max(8, o.w + dx), h: o.type === 'image' ? Math.max(8, o.h * ((o.w + dx) / o.w)) : Math.max(4, o.h + dy) });
+      } else if (o.type === 'ink') {
+        p.onUpdate(o.id, { points: o.points.map(([px, py]) => [px + dx, py + dy] as [number, number]) });
+      } else {
+        p.onUpdate(o.id, { x: (o as { x: number }).x + dx, y: (o as { y: number }).y + dy });
+      }
+      return;
+    }
+    if (!draft) return;
+    if (draft.type === 'ink') setDraft({ ...draft, points: [...draft.points, [x, y]] });
+    else if ('w' in draft) {
+      const { ox, oy } = draft as unknown as { ox: number; oy: number };
+      setDraft({ ...draft, x: Math.min(ox, x), y: Math.min(oy, y), w: Math.abs(x - ox), h: Math.abs(y - oy) });
+    }
+  };
+
+  const onUp = () => {
+    drag.current = null;
+    if (!draft) return;
+    const ok = draft.type === 'ink' ? draft.points.length > 1 : 'w' in draft && draft.w > 3 && draft.h > 3;
+    if (ok) {
+      const { ox, oy, ...clean } = draft as unknown as Annot & { ox?: number; oy?: number };
+      void ox; void oy;
+      p.onAdd(clean as Annot);
+    }
+    setDraft(null);
+  };
+
+  const z = p.zoom;
+  const all = draft ? [...mine, draft] : mine;
+  return (
+    <div
+      ref={ref}
+      className={`annot-layer tool-${p.tool}`}
+      onPointerDown={onDown}
+      onPointerMove={onMove}
+      onPointerUp={onUp}
+      onPointerCancel={onUp}
+    >
+      <svg width={p.size.w * z} height={p.size.h * z} viewBox={`0 0 ${p.size.w} ${p.size.h}`} className="annot-svg">
+        {all.map((a) => {
+          if (a.type === 'ink') {
+            const d = a.points.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)} ${y.toFixed(1)}`).join(' ');
+            return (
+              <g key={a.id} data-annot={a.id} className={a.id === p.selected ? 'sel' : ''}>
+                <path d={d} stroke="transparent" strokeWidth={12} fill="none" />
+                <path d={d} stroke={a.color} strokeWidth={a.width} fill="none" strokeLinecap="round" strokeLinejoin="round" />
+              </g>
+            );
+          }
+          if (a.type === 'highlight' || a.type === 'rect' || a.type === 'whiteout') {
+            return (
+              <rect
+                key={a.id}
+                data-annot={a.id}
+                className={a.id === p.selected ? 'sel' : ''}
+                x={a.x} y={a.y} width={a.w} height={a.h}
+                fill={a.type === 'rect' ? 'transparent' : a.type === 'whiteout' ? '#fff' : a.color}
+                fillOpacity={a.type === 'highlight' ? 0.35 : 1}
+                stroke={a.type === 'rect' ? a.color : a.type === 'whiteout' ? '#ddd' : 'none'}
+                strokeWidth={a.type === 'rect' ? 1.5 : 0.5}
+              />
+            );
+          }
+          return null;
+        })}
+      </svg>
+      {mine.map((a) => {
+        if (a.type === 'text') {
+          return (
+            <div
+              key={a.id}
+              data-annot={a.id}
+              className={`annot-text ${a.id === p.selected ? 'sel' : ''}`}
+              style={{ left: a.x * z, top: a.y * z, fontSize: a.size * z, color: a.color }}
+            >
+              <textarea
+                autoFocus={!a.text}
+                value={a.text}
+                rows={Math.max(1, a.text.split('\n').length)}
+                placeholder="Nhập chữ…"
+                style={{ width: `${Math.max(4, ...a.text.split('\n').map((l) => l.length)) * 0.62 + 1.2}em` }}
+                onFocus={() => p.onSelect(a.id)}
+                onChange={(e) => p.onUpdate(a.id, { text: e.target.value })}
+              />
+            </div>
+          );
+        }
+        if (a.type === 'image') {
+          return (
+            <div
+              key={a.id}
+              data-annot={a.id}
+              className={`annot-img ${a.id === p.selected ? 'sel' : ''}`}
+              style={{ left: a.x * z, top: a.y * z, width: a.w * z, height: a.h * z }}
+            >
+              <img src={a.dataUrl} alt="" draggable={false} />
+              {a.id === p.selected && <span className="handle" data-handle="1" />}
+            </div>
+          );
+        }
+        if ((a.type === 'rect' || a.type === 'highlight' || a.type === 'whiteout') && a.id === p.selected) {
+          return (
+            <div key={a.id + 'h'} data-annot={a.id} className="annot-box-handle"
+              style={{ left: (a.x + a.w) * z - 6, top: (a.y + a.h) * z - 6 }}>
+              <span className="handle" data-handle="1" />
+            </div>
+          );
+        }
+        return null;
+      })}
+    </div>
+  );
+}
