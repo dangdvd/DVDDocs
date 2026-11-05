@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import * as pdfjs from 'pdfjs-dist';
 import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
@@ -18,6 +18,9 @@ if (typeof FontFace !== 'undefined') {
 
 type Tool = 'select' | 'text' | 'highlight' | 'rect' | 'whiteout' | 'ink' | 'place';
 type Size = { w: number; h: number };
+
+const MIN_ZOOM = 0.2, MAX_ZOOM = 5;
+const clampZoom = (z: number) => +Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z)).toFixed(3);
 
 interface Snapshot { bytes: Uint8Array; annots: Annot[] }
 
@@ -53,6 +56,90 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
   const [hits, setHits] = useState<number[] | null>(null);
   const [hitIdx, setHitIdx] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const pagesRef = useRef<HTMLDivElement>(null);
+  const fitted = useRef(false);
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  /** Điểm nội dung cần giữ nguyên dưới ngón tay/con trỏ sau khi đổi tỉ lệ. */
+  const anchor = useRef<{ cx: number; cy: number; vx: number; vy: number; from: number } | null>(null);
+
+  const fitZoom = (s: Size[] = sizes) => {
+    const w = scrollRef.current?.clientWidth ?? window.innerWidth;
+    const maxW = Math.max(...s.map((p) => p.w), 1);
+    const pad = w < 700 ? 8 : 40;
+    return clampZoom((w - pad) / maxW);
+  };
+
+  /** Đổi tỉ lệ, giữ điểm (vx, vy) trong khung nhìn đứng yên (mặc định là tâm khung). */
+  const zoomTo = (next: number, vx?: number, vy?: number) => {
+    const el = scrollRef.current;
+    const z = clampZoom(next);
+    if (el) {
+      const px = vx ?? el.clientWidth / 2, py = vy ?? el.clientHeight / 2;
+      anchor.current = { cx: el.scrollLeft + px, cy: el.scrollTop + py, vx: px, vy: py, from: zoomRef.current };
+    }
+    setZoom(z);
+  };
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current, a = anchor.current;
+    if (!el || !a) return;
+    anchor.current = null;
+    const k = zoom / a.from;
+    el.scrollLeft = a.cx * k - a.vx;
+    el.scrollTop = a.cy * k - a.vy;
+  }, [zoom]);
+
+  // Chụm hai ngón để phóng to/thu nhỏ (điện thoại, máy tính bảng) và Ctrl + lăn chuột (máy tính).
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    let pinch: { d0: number; mx: number; my: number; scale: number } | null = null;
+    const dist = (t: TouchList) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+    const mid = (t: TouchList) => {
+      const r = el.getBoundingClientRect();
+      return { x: (t[0].clientX + t[1].clientX) / 2 - r.left, y: (t[0].clientY + t[1].clientY) / 2 - r.top };
+    };
+    const onStart = (e: TouchEvent) => {
+      if (e.touches.length !== 2) return;
+      const m = mid(e.touches);
+      pinch = { d0: dist(e.touches), mx: m.x, my: m.y, scale: 1 };
+      const pages = pagesRef.current;
+      if (pages) pages.style.transformOrigin = `${el.scrollLeft + m.x}px ${el.scrollTop + m.y}px`;
+    };
+    const onMove = (e: TouchEvent) => {
+      if (!pinch || e.touches.length !== 2) return;
+      e.preventDefault();
+      const z0 = zoomRef.current;
+      pinch.scale = clampZoom(z0 * (dist(e.touches) / pinch.d0)) / z0;
+      if (pagesRef.current) pagesRef.current.style.transform = `scale(${pinch.scale})`;
+    };
+    const onEnd = () => {
+      if (!pinch) return;
+      const p = pinch;
+      pinch = null;
+      if (pagesRef.current) pagesRef.current.style.transform = '';
+      if (Math.abs(p.scale - 1) > 0.01) zoomTo(zoomRef.current * p.scale, p.mx, p.my);
+    };
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      const r = el.getBoundingClientRect();
+      zoomTo(zoomRef.current * Math.exp(-e.deltaY * 0.002), e.clientX - r.left, e.clientY - r.top);
+    };
+    el.addEventListener('touchstart', onStart, { passive: true });
+    el.addEventListener('touchmove', onMove, { passive: false });
+    el.addEventListener('touchend', onEnd);
+    el.addEventListener('touchcancel', onEnd);
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      el.removeEventListener('touchstart', onStart);
+      el.removeEventListener('touchmove', onMove);
+      el.removeEventListener('touchend', onEnd);
+      el.removeEventListener('touchcancel', onEnd);
+      el.removeEventListener('wheel', onWheel);
+    };
+  }, []);
 
   // Nạp tài liệu vào pdf.js mỗi khi nội dung thay đổi.
   useEffect(() => {
@@ -66,6 +153,10 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
           s.push({ w: vp.width, h: vp.height });
         }
         if (cancelled) return d.destroy();
+        if (!fitted.current) {
+          fitted.current = true;
+          setZoom(fitZoom(s));
+        }
         setSizes(s);
         setDoc((old) => {
           old?.destroy();
@@ -245,14 +336,10 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
           </label>
           {selected && <ToolButton icon="🗑" label="Xoá" onClick={removeSelected} />}
           <Sep />
-          <ToolButton icon="−" label="Thu nhỏ" onClick={() => setZoom((z) => Math.max(0.4, +(z - 0.2).toFixed(2)))} />
+          <ToolButton icon="−" label="Thu nhỏ" onClick={() => zoomTo(zoom / 1.25)} />
           <span className="tb-zoom">{Math.round(zoom * 100)}%</span>
-          <ToolButton icon="+" label="Phóng to" onClick={() => setZoom((z) => Math.min(4, +(z + 0.2).toFixed(2)))} />
-          <ToolButton icon="⇔" label="Vừa khung" onClick={() => {
-            const w = scrollRef.current?.clientWidth ?? 800;
-            const maxW = Math.max(...sizes.map((s) => s.w), 1);
-            setZoom(+((w - 40) / maxW).toFixed(2));
-          }} />
+          <ToolButton icon="+" label="Phóng to" onClick={() => zoomTo(zoom * 1.25)} />
+          <ToolButton icon="⇔" label="Vừa khung" onClick={() => zoomTo(fitZoom())} />
           <Sep />
           <ToolButton icon="▤" label="Trang" active={showThumbs} onClick={() => setShowThumbs((v) => !v)} />
           <ToolButton icon="⊕" label="Gộp PDF" onClick={() => run('Đang gộp…', async () => {
@@ -301,8 +388,9 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
             ))}
           </aside>
         )}
-        <div className="pdf-scroll" ref={scrollRef} onPointerDown={(e) => { if (e.target === e.currentTarget) setSelected(null); }}>
+        <div className="pdf-scroll" ref={scrollRef} onPointerDown={(e) => { if (e.target === e.currentTarget || e.target === pagesRef.current) setSelected(null); }}>
           {!doc && !error && <div className="loading">Đang mở tài liệu…</div>}
+          <div className="pdf-pages" ref={pagesRef}>
           {doc && sizes.map((s, i) => (
             <div key={i} className="pdf-page" data-page={i} style={{ width: s.w * zoom, height: s.h * zoom }}>
               <PdfCanvas doc={doc} index={i} zoom={zoom} size={s} />
@@ -323,7 +411,15 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
               />
             </div>
           ))}
+          </div>
         </div>
+        {doc && (
+          <div className="zoom-float" role="group" aria-label="Thu phóng">
+            <button onClick={() => zoomTo(zoom / 1.25)} title="Thu nhỏ" aria-label="Thu nhỏ">−</button>
+            <button className="zoom-pct" onClick={() => zoomTo(fitZoom())} title="Vừa khung">{Math.round(zoom * 100)}%</button>
+            <button onClick={() => zoomTo(zoom * 1.25)} title="Phóng to" aria-label="Phóng to">+</button>
+          </div>
+        )}
       </div>
       {showSign && (
         <SignaturePad
