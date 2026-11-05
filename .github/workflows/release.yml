@@ -1,9 +1,14 @@
 name: Release
 # Tạo bản cài đặt cho Windows, macOS, Linux, Android và bản web.
-# Đẩy một tag dạng v0.1.0 để tạo GitHub Release kèm các tệp cài đặt.
+# Mỗi khi main có phiên bản mới (trường version trong package.json) chưa có Release,
+# quy trình tự tạo tag vX.Y.Z và GitHub Release kèm các tệp cài đặt.
+# Trên pull request chỉ build để kiểm tra, không phát hành.
 on:
   push:
+    branches: [main]
     tags: ['v*']
+  pull_request:
+    paths: ['.github/workflows/release.yml', 'package.json', 'electron/**', 'capacitor.config.json']
   workflow_dispatch:
 
 permissions:
@@ -98,17 +103,31 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: [desktop, android, web]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - name: Kiểm tra phiên bản
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v$(node -p "require('./package.json').version")"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG đã tồn tại, bỏ qua."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.ver.outputs.exists != 'true'
+        uses: actions/download-artifact@v4
         with: { path: artifacts, merge-multiple: true }
-      - run: ls -la artifacts
-      - uses: softprops/action-gh-release@v2
+      - if: steps.ver.outputs.exists != 'true'
+        uses: softprops/action-gh-release@v2
         with:
-          name: DVDDocs ${{ github.ref_name }} (bản dùng thử)
+          tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: DVDDocs ${{ steps.ver.outputs.tag }} (bản dùng thử)
           body_path: .github/release-notes.md
           prerelease: true
           files: artifacts/*
