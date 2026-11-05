@@ -90,7 +90,7 @@ button { font: inherit; color: inherit; }
 .statusbar { padding: 4px 12px calc(4px + env(safe-area-inset-bottom)); font-size: .78rem; color: var(--muted); background: var(--panel); border-top: 1px solid var(--border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* ---------- PDF ---------- */
-.pdf-body { flex: 1; min-height: 0; display: flex; }
+.pdf-body { flex: 1; min-height: 0; display: flex; position: relative; }
 .pdf-thumbs { width: 170px; flex-shrink: 0; overflow-y: auto; border-right: 1px solid var(--border); background: var(--panel); padding: 10px; display: flex; flex-direction: column; gap: 12px; }
 .thumb { display: flex; flex-direction: column; align-items: center; gap: 4px; }
 .thumb-img { border: 1px solid var(--border); padding: 0; background: #fff; cursor: pointer; line-height: 0; }
@@ -100,8 +100,14 @@ button { font: inherit; color: inherit; }
 .thumb-actions button { border: 0; background: none; cursor: pointer; padding: 2px 4px; border-radius: 4px; }
 .thumb-actions button:hover:not(:disabled) { background: var(--accent-soft); }
 .thumb-actions button:disabled { opacity: .3; }
-.pdf-scroll { flex: 1; overflow: auto; padding: 20px; display: flex; flex-direction: column; align-items: center; gap: 18px; background: var(--bg); }
-.pdf-page { position: relative; background: #fff; box-shadow: var(--page-shadow); flex-shrink: 0; }
+.pdf-scroll { flex: 1; overflow: auto; background: var(--bg); -webkit-overflow-scrolling: touch; touch-action: pan-x pan-y; }
+/* Trang rộng hơn khung vẫn cuộn được tới mép trái: căn giữa bằng margin auto thay vì align-items: center. */
+.pdf-pages { display: flex; flex-direction: column; align-items: flex-start; gap: 18px; padding: 20px; width: max-content; min-width: 100%; will-change: transform; }
+.pdf-page { position: relative; background: #fff; box-shadow: var(--page-shadow); flex-shrink: 0; margin: 0 auto; }
+.zoom-float { position: absolute; right: 14px; bottom: 14px; z-index: 6; display: flex; align-items: center; background: var(--panel); border: 1px solid var(--border); border-radius: 22px; box-shadow: 0 4px 14px rgba(0, 0, 0, .18); overflow: hidden; }
+.zoom-float button { border: 0; background: none; min-width: 44px; height: 44px; font-size: 1.3rem; cursor: pointer; color: var(--text); }
+.zoom-float button:hover { background: var(--accent-soft); }
+.zoom-float .zoom-pct { font-size: .8rem; min-width: 56px; border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
 .pdf-canvas { display: block; }
 .annot-layer { position: absolute; inset: 0; touch-action: none; }
 .annot-layer.tool-select { touch-action: pan-x pan-y; }
@@ -180,7 +186,7 @@ button { font: inherit; color: inherit; }
 @media (max-width: 700px) {
   .editor-header .btn:not(.primary) { display: none; }
   .pdf-thumbs { position: absolute; z-index: 5; height: 100%; box-shadow: var(--page-shadow); }
-  .pdf-scroll { padding: 10px 4px; }
+  .pdf-pages { padding: 4px; gap: 10px; }
 }
 
 @media print {
