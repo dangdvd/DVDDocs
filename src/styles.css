@@ -109,6 +109,7 @@ button { font: inherit; color: inherit; }
 .zoom-float button:hover { background: var(--accent-soft); }
 .zoom-float .zoom-pct { font-size: .8rem; min-width: 56px; border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
 .pdf-canvas { display: block; }
+.pdf-detail { position: absolute; pointer-events: none; }
 .annot-layer { position: absolute; inset: 0; touch-action: none; }
 .annot-layer.tool-select { touch-action: pan-x pan-y; }
 .annot-layer:not(.tool-select) { cursor: crosshair; }

@@ -435,27 +435,47 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
   );
 }
 
+/** Số điểm ảnh tối đa cho canvas cả trang. iOS giới hạn mỗi canvas ~16,7 triệu điểm ảnh và tổng bộ nhớ canvas,
+ * vượt quá thì canvas trắng trơn. Khi phóng to lớn, trang được vẽ mờ ở mức này rồi phủ thêm một canvas nét
+ * chỉ cho phần đang nhìn thấy. */
+const MAX_CANVAS_PIXELS = 4_000_000;
+
+type Region = { x: number; y: number; w: number; h: number };
+
 /** Vẽ một trang PDF lên canvas khi trang xuất hiện trong khung nhìn. */
 function PdfCanvas({ doc, index, zoom, size }: { doc: PDFDocumentProxy; index: number; zoom: number; size: Size }) {
   const ref = useRef<HTMLCanvasElement>(null);
+  const detailRef = useRef<HTMLCanvasElement>(null);
   const [visible, setVisible] = useState(false);
+  const [region, setRegion] = useState<Region | null>(null);
+  const [shown, setShown] = useState<(Region & { zoom: number }) | null>(null);
+
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const want = zoom * dpr;
+  const baseScale = Math.min(want, Math.sqrt(MAX_CANVAS_PIXELS / (size.w * size.h)));
+  const needDetail = baseScale < want * 0.98;
 
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const io = new IntersectionObserver(([e]) => e.isIntersecting && setVisible(true), { rootMargin: '600px' });
+    const io = new IntersectionObserver(([e]) => setVisible(e.isIntersecting), { rootMargin: '600px' });
     io.observe(el);
-    return () => io.disconnect();
+    return () => {
+      io.disconnect();
+      // Giải phóng bộ nhớ canvas ngay (Safari giữ lại đến khi GC).
+      el.width = el.height = 0;
+      if (detailRef.current) detailRef.current.width = detailRef.current.height = 0;
+    };
   }, []);
 
+  // Canvas cả trang, độ phân giải bị giới hạn.
   useEffect(() => {
     if (!visible) return;
     let task: RenderTask | null = null;
     let cancelled = false;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
     doc.getPage(index + 1).then((page) => {
       if (cancelled || !ref.current) return;
-      const vp = page.getViewport({ scale: zoom * dpr });
+      const vp = page.getViewport({ scale: baseScale });
       const canvas = ref.current;
       canvas.width = Math.floor(vp.width);
       canvas.height = Math.floor(vp.height);
@@ -466,9 +486,90 @@ function PdfCanvas({ doc, index, zoom, size }: { doc: PDFDocumentProxy; index: n
       cancelled = true;
       task?.cancel();
     };
-  }, [doc, index, zoom, visible]);
+  }, [doc, index, baseScale, visible]);
 
-  return <canvas ref={ref} className="pdf-canvas" style={{ width: size.w * zoom, height: size.h * zoom }} />;
+  // Theo dõi phần trang đang nằm trong khung cuộn để vẽ nét phần đó.
+  useEffect(() => {
+    if (!visible || !needDetail) {
+      setRegion(null);
+      return;
+    }
+    const canvas = ref.current!;
+    const scroller = canvas.closest('.pdf-scroll') as HTMLElement | null;
+    if (!scroller) return;
+    let timer = 0;
+    const measure = () => {
+      const pr = canvas.getBoundingClientRect();
+      const sr = scroller.getBoundingClientRect();
+      // Chừa thêm 1/4 khung nhìn mỗi phía để cuộn nhẹ không lộ phần mờ.
+      const mx = sr.width / 4, my = sr.height / 4;
+      const x0 = Math.max(0, sr.left - mx - pr.left), y0 = Math.max(0, sr.top - my - pr.top);
+      const x1 = Math.min(pr.width, sr.right + mx - pr.left), y1 = Math.min(pr.height, sr.bottom + my - pr.top);
+      if (x1 <= x0 || y1 <= y0) return setRegion(null);
+      const r = { x: Math.floor(x0), y: Math.floor(y0), w: Math.ceil(x1 - Math.floor(x0)), h: Math.ceil(y1 - Math.floor(y0)) };
+      setRegion((old) => (old && old.x === r.x && old.y === r.y && old.w === r.w && old.h === r.h ? old : r));
+    };
+    const later = () => {
+      clearTimeout(timer);
+      timer = window.setTimeout(measure, 120);
+    };
+    measure();
+    scroller.addEventListener('scroll', later, { passive: true });
+    window.addEventListener('resize', later);
+    return () => {
+      clearTimeout(timer);
+      scroller.removeEventListener('scroll', later);
+      window.removeEventListener('resize', later);
+    };
+  }, [visible, needDetail, zoom]);
+
+  // Canvas nét cho phần đang nhìn thấy.
+  useEffect(() => {
+    if (!region || !needDetail) {
+      setShown(null);
+      return;
+    }
+    let task: RenderTask | null = null;
+    let cancelled = false;
+    doc.getPage(index + 1).then((page) => {
+      const canvas = detailRef.current;
+      if (cancelled || !canvas) return;
+      const vp = page.getViewport({ scale: want, offsetX: -region.x * dpr, offsetY: -region.y * dpr });
+      // Vẽ vào canvas tạm rồi mới chép sang, để không bị nháy trắng khi đang vẽ.
+      const tmp = document.createElement('canvas');
+      tmp.width = Math.ceil(region.w * dpr);
+      tmp.height = Math.ceil(region.h * dpr);
+      task = page.render({ canvasContext: tmp.getContext('2d')!, viewport: vp });
+      task.promise
+        .then(() => {
+          if (cancelled || !detailRef.current) return;
+          canvas.width = tmp.width;
+          canvas.height = tmp.height;
+          canvas.getContext('2d')!.drawImage(tmp, 0, 0);
+          setShown({ ...region, zoom });
+        })
+        .catch(() => {})
+        .finally(() => {
+          tmp.width = tmp.height = 0;
+        });
+    });
+    return () => {
+      cancelled = true;
+      task?.cancel();
+    };
+  }, [doc, index, region, want, needDetail]);
+
+  const detailOk = needDetail && shown && shown.zoom === zoom;
+  return (
+    <>
+      <canvas ref={ref} className="pdf-canvas" style={{ width: size.w * zoom, height: size.h * zoom }} />
+      <canvas
+        ref={detailRef}
+        className="pdf-canvas pdf-detail"
+        style={detailOk ? { left: shown.x, top: shown.y, width: shown.w, height: shown.h } : { display: 'none' }}
+      />
+    </>
+  );
 }
 
 interface LayerProps {
