@@ -9,9 +9,10 @@ Bản dùng thử của DVDDocs: xem và chỉnh sửa PDF, Word (.docx), Excel 
 | macOS (chip Intel) | `DVDDocs-…-mac-x64.dmg` | Như trên. |
 | Linux | `DVDDocs-…-linux-x86_64.AppImage` | `chmod +x` tệp rồi chạy. |
 | Android 7 trở lên | `DVDDocs-…-Android.apk` | Tải về điện thoại, mở tệp và cho phép **Cài ứng dụng không rõ nguồn gốc** khi được hỏi. |
+| iPhone / iPad (iOS 14+) | `DVDDocs-…-iOS-unsigned.ipa` | Tệp chưa ký: cài bằng **Sideloadly** hoặc **AltStore** trên máy tính, đăng nhập Apple ID của bạn để công cụ tự ký. Với Apple ID miễn phí, ứng dụng chạy được 7 ngày rồi cần cài lại (AltStore tự gia hạn được). |
 | Web | `DVDDocs-…-Web.zip` | Giải nén và đưa lên bất kỳ máy chủ web tĩnh nào. |
 
-**iPhone/iPad:** Apple không cho cài ứng dụng ngoài App Store/TestFlight. Cần tài khoản Apple Developer để phát hành qua TestFlight; trong lúc chờ có thể dùng bản Web trên Safari.
+**Muốn cài iPhone không giới hạn 7 ngày / qua TestFlight:** cần tài khoản Apple Developer Program (99 USD/năm) để ký và tải bản build lên App Store Connect.
 
 ## Tính năng chính
 - **PDF:** xem, tìm chữ, thêm chữ tiếng Việt, tô sáng, khung, che trắng, bút vẽ, chữ ký tay, chèn ảnh; xoay, sắp xếp, chèn, xoá, gộp trang.
