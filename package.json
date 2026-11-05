@@ -18,8 +18,10 @@
     "mobile:android": "npm run build && cap add android && cap sync android && cap open android",
     "mobile:ios": "npm run build && cap add ios && cap sync ios && cap open ios"
   },
-  "dependencies": {
+  "dependencies": {},
+  "devDependencies": {
     "@capacitor/android": "^7.2.0",
+    "@capacitor/cli": "^7.2.0",
     "@capacitor/core": "^7.2.0",
     "@capacitor/filesystem": "^7.0.1",
     "@capacitor/ios": "^7.2.0",
@@ -37,26 +39,23 @@
     "@tiptap/extension-underline": "^2.11.5",
     "@tiptap/react": "^2.11.5",
     "@tiptap/starter-kit": "^2.11.5",
-    "docx": "^9.5.0",
-    "docx-preview": "^0.3.5",
-    "exceljs": "^4.4.0",
-    "fast-formula-parser": "^1.0.19",
-    "mammoth": "^1.9.0",
-    "pdf-lib": "^1.17.1",
-    "pdfjs-dist": "^4.10.38",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
-  },
-  "devDependencies": {
-    "@capacitor/cli": "^7.2.0",
     "@types/react": "^18.3.20",
     "@types/react-dom": "^18.3.6",
     "@vitejs/plugin-react": "^4.4.1",
     "cross-env": "^7.0.3",
+    "docx": "^9.5.0",
+    "docx-preview": "^0.3.5",
     "electron": "^36.2.0",
     "electron-builder": "^26.0.12",
+    "exceljs": "^4.4.0",
+    "fast-formula-parser": "^1.0.19",
     "jsdom": "^26.1.0",
     "jszip": "^3.10.1",
+    "mammoth": "^1.9.0",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^4.10.38",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
     "typescript": "^5.8.3",
     "vite": "^6.3.5",
     "vitest": "^3.1.2"
@@ -69,8 +68,7 @@
     },
     "files": [
       "dist/**",
-      "electron/**",
-      "public/icon.svg"
+      "electron/**"
     ],
     "fileAssociations": [
       {
@@ -87,15 +85,46 @@
       }
     ],
     "win": {
-      "target": "nsis"
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
     },
     "mac": {
-      "target": "dmg",
-      "category": "public.app-category.productivity"
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.productivity",
+      "identity": null
     },
     "linux": {
-      "target": "AppImage",
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
       "category": "Office"
+    },
+    "artifactName": "DVDDocs-${version}-${os}-${arch}.${ext}",
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "DVDDocs-${version}-Windows-Setup.${ext}"
     }
-  }
+  },
+  "author": "DVD",
+  "homepage": "https://github.com/dangdvd/DVDDocs"
 }

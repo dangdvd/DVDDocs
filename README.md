@@ -11,6 +11,9 @@ DVDDocs: Đọc & Sửa PDF, Office. Một ứng dụng duy nhất để **xem v
 
 Mọi tệp được xử lý ngay trên thiết bị, không tải lên máy chủ nào.
 
+**Tải bản cài đặt dùng thử:** xem mục [Releases](https://github.com/dangdvd/DVDDocs/releases) (Windows, macOS, Linux, Android APK, Web).
+Để phát hành bản mới: tăng `version` trong `package.json` và merge vào `main`; quy trình `.github/workflows/release.yml` tự build và tạo Release `vX.Y.Z`.
+
 ## Tính năng (bản 0.1)
 
 **PDF**

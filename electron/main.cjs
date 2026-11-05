@@ -27,7 +27,7 @@ function createWindow() {
     height: 860,
     minWidth: 360,
     title: 'DVDDocs',
-    icon: path.join(__dirname, '..', 'public', 'icon.svg'),
+    icon: path.join(__dirname, '..', 'dist', 'icon.svg'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
