@@ -1,5 +1,5 @@
 name: Release
-# Tạo bản cài đặt cho Windows, macOS, Linux, Android và bản web.
+# Tạo bản cài đặt cho Windows, macOS, Linux, Android, iOS (IPA chưa ký) và bản web.
 # Mỗi khi main có phiên bản mới (trường version trong package.json) chưa có Release,
 # quy trình tự tạo tag vX.Y.Z và GitHub Release kèm các tệp cài đặt.
 # Trên pull request chỉ build để kiểm tra, không phát hành.
@@ -84,6 +84,36 @@ jobs:
           path: out/*.apk
           if-no-files-found: error
 
+  ios:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npm run build
+      - run: npx cap add ios
+      - run: npx cap sync ios
+      - name: Build IPA (chưa ký)
+        run: |
+          cd ios/App
+          if [ -d App.xcworkspace ]; then SRC="-workspace App.xcworkspace"; else SRC="-project App.xcodeproj"; fi
+          xcodebuild $SRC -scheme App -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/App.xcarchive" archive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" | tail -n 40
+          cd "$GITHUB_WORKSPACE"
+          VERSION=$(node -p "require('./package.json').version")
+          mkdir -p out "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$RUNNER_TEMP/App.xcarchive/Products/Applications/App.app" "$RUNNER_TEMP/ipa/Payload/"
+          (cd "$RUNNER_TEMP/ipa" && zip -qry "$GITHUB_WORKSPACE/out/DVDDocs-${VERSION}-iOS-unsigned.ipa" Payload)
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios
+          path: out/*.ipa
+          if-no-files-found: error
+
   web:
     needs: test
     runs-on: ubuntu-latest
@@ -104,7 +134,7 @@ jobs:
 
   release:
     if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    needs: [desktop, android, web]
+    needs: [desktop, android, ios, web]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
