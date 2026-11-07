@@ -138,26 +138,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Kiểm tra phiên bản
-        id: ver
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, merge-multiple: true }
+      # Tạo Release nếu chưa có, rồi tải lên mọi tệp còn thiếu (có thử lại).
+      # Chạy lại job này sẽ bổ sung các tệp bị lỗi tải lên ở lần trước.
+      - name: Phát hành
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="v$(node -p "require('./package.json').version")"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG đã tồn tại, bỏ qua."
-            echo "exists=true" >> "$GITHUB_OUTPUT"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --target "$GITHUB_SHA" --prerelease \
+              --title "DVDDocs $TAG (bản dùng thử)" --notes-file .github/release-notes.md
           fi
-      - if: steps.ver.outputs.exists != 'true'
-        uses: actions/download-artifact@v4
-        with: { path: artifacts, merge-multiple: true }
-      - if: steps.ver.outputs.exists != 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.ver.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          name: DVDDocs ${{ steps.ver.outputs.tag }} (bản dùng thử)
-          body_path: .github/release-notes.md
-          prerelease: true
-          files: artifacts/*
+          have="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          for f in artifacts/*; do
+            name="$(basename "$f")"
+            if grep -qxF "$name" <<<"$have"; then echo "Đã có $name"; continue; fi
+            for n in 1 2 3 4; do
+              if gh release upload "$TAG" "$f" --clobber; then echo "Đã tải lên $name"; break; fi
+              [ "$n" = 4 ] && { echo "::error::Không tải lên được $name"; exit 1; }
+              sleep $((n * 10))
+            done
+          done
