@@ -3,8 +3,8 @@ import { OpenedFile, saveFile } from '../../lib/fileio';
 import { EditorShell, Sep, ToolButton } from '../../components/EditorShell';
 import { uid } from '../../lib/uid';
 import {
-  Book, Cell, CellStyle, Engine, Sheet, addr, colName, emptySheet, formatValue, key, moveFormula,
-  parseInput, parseKey, rawText, shiftFormula, usedRange,
+  Book, Cell, CellStyle, Engine, Merge, Sheet, addr, colName, emptySheet, findMatches, formatValue, key, mergeAt,
+  moveFormula, parseInput, parseKey, rawText, replaceInCell, shiftFormula, shiftMerges, usedRange,
 } from './sheetModel';
 import { LoadedBook, loadXlsx, saveXlsx } from './xlsxIO';
 
@@ -15,6 +15,17 @@ const HEAD_H = 24;
 
 interface Sel { r: number; c: number; r2: number; c2: number }
 const norm = (s: Sel) => ({ r0: Math.min(s.r, s.r2), r1: Math.max(s.r, s.r2), c0: Math.min(s.c, s.c2), c1: Math.max(s.c, s.c2) });
+
+/** Chỉ số i lớn nhất có xs[i] <= v (xs tăng dần, là toạ độ bắt đầu của từng hàng/cột). */
+function indexAt(xs: number[], v: number) {
+  let lo = 0, hi = xs.length - 2;
+  if (hi < 0) return 0;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (xs[mid] <= v) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
 
 const NUM_FORMATS: [string, string][] = [
   ['General', 'Chung'], ['#,##0', 'Số 1.234'], ['#,##0.00', 'Số 1.234,56'], ['0%', 'Phần trăm'],
@@ -36,6 +47,8 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
   const [path, setPath] = useState(file.path);
   const [name, setName] = useState(file.name);
   const clip = useRef<{ text: string; r: number; c: number; cells: (Cell | undefined)[][] } | null>(null);
+  const [find, setFind] = useState<{ q: string; repl: string; idx: number; replace: boolean } | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (isNew) return;
@@ -102,11 +115,20 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
     gridRef.current?.focus();
   };
 
+  /** Chọn một ô; nếu ô nằm trong vùng gộp thì chọn cả vùng. */
+  const selectCell = (r: number, c: number): Sel => {
+    const m = mergeAt(sheet?.merges, r, c);
+    return m ? { r: m.r0, c: m.c0, r2: m.r1, c2: m.c1 } : { r, c, r2: r, c2: c };
+  };
+
   const moveSel = (dr: number, dc: number, extend = false) => {
     setSel((s) => {
       if (extend) return { ...s, r2: Math.max(0, s.r2 + dr), c2: Math.max(0, s.c2 + dc) };
-      const r = Math.max(0, s.r + dr), c = Math.max(0, s.c + dc);
-      return { r, c, r2: r, c2: c };
+      const cur = mergeAt(sheet?.merges, s.r, s.c);
+      let r = s.r + dr, c = s.c + dc;
+      if (cur && dr > 0) r = cur.r1 + 1;
+      if (cur && dc > 0) c = cur.c1 + 1;
+      return selectCell(Math.max(0, r), Math.max(0, c));
     });
   };
 
@@ -219,8 +241,19 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
           }
           cells[key(r, c)] = cell;
         }
+        if (i !== active) return { ...s, cells };
         let colWidths = s.colWidths;
-        if (i === active && axis === 'col') {
+        let rowHeights = s.rowHeights;
+        if (axis === 'row' && rowHeights) {
+          rowHeights = {};
+          for (const [ri, h] of Object.entries(s.rowHeights!)) {
+            const n = Number(ri);
+            if (n < at) rowHeights[n] = h;
+            else if (d > 0) rowHeights[n + d] = h;
+            else if (n >= at - d) rowHeights[n + d] = h;
+          }
+        }
+        if (axis === 'col') {
           colWidths = {};
           for (const [ci, w] of Object.entries(s.colWidths)) {
             const n = Number(ci);
@@ -229,7 +262,10 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
             else if (n >= at - d) colWidths[n + d] = w;
           }
         }
-        return { ...s, cells, colWidths, rowCount: s.rowCount + (axis === 'row' && i === active && d > 0 ? d : 0), colCount: s.colCount + (axis === 'col' && i === active && d > 0 ? d : 0) };
+        return {
+          ...s, cells, colWidths, rowHeights, merges: shiftMerges(s.merges, axis, at, d),
+          rowCount: s.rowCount + (axis === 'row' && d > 0 ? d : 0), colCount: s.colCount + (axis === 'col' && d > 0 ? d : 0),
+        };
       }),
     }));
   };
@@ -262,6 +298,73 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
       }
     });
     setCells(out);
+  };
+
+  /** Gộp vùng chọn (giữ dữ liệu ô trên cùng bên trái, căn giữa) hoặc bỏ gộp nếu vùng chọn đang chứa ô gộp. */
+  const toggleMerge = () => {
+    if (!sheet) return;
+    const { r0, r1, c0, c1 } = norm(sel);
+    const ms = sheet.merges ?? [];
+    const hit = ms.filter((m) => !(m.r1 < r0 || m.r0 > r1 || m.c1 < c0 || m.c0 > c1));
+    if (hit.length) return updateSheet((s) => ({ ...s, merges: (s.merges ?? []).filter((m) => !hit.some((h) => h.r0 === m.r0 && h.c0 === m.c0)) }));
+    if (r0 === r1 && c0 === c1) return;
+    let lose = false;
+    for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
+      const cell = sheet.cells[key(r, c)];
+      if ((r !== r0 || c !== c0) && cell && (cell.f || (cell.v != null && cell.v !== ''))) lose = true;
+    }
+    if (lose && !confirm('Gộp ô chỉ giữ dữ liệu của ô trên cùng bên trái. Tiếp tục?')) return;
+    updateSheet((s) => {
+      const cells = { ...s.cells };
+      for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
+        if (r === r0 && c === c0) continue;
+        const k = key(r, c);
+        if (cells[k]?.s) cells[k] = { s: cells[k].s }; else delete cells[k];
+      }
+      const master = cells[key(r0, c0)] ?? {};
+      cells[key(r0, c0)] = { ...master, s: { ...master.s, align: master.s?.align ?? 'center' } };
+      return { ...s, cells, merges: [...(s.merges ?? []), { r0, c0, r1, c1 }] };
+    });
+    setSel({ r: r0, c: c0, r2: r1, c2: c1 });
+  };
+
+  const fullBorder = (st?: CellStyle) => !!(st?.border?.t && st.border.r && st.border.b && st.border.l);
+  const toggleBorder = () => {
+    const on = !fullBorder(activeCell?.s);
+    applyStyle({ border: on ? { t: true, r: true, b: true, l: true } : undefined });
+  };
+
+  const toggleFreeze = () => {
+    if (!sheet) return;
+    if (sheet.freeze) return updateSheet((s) => ({ ...s, freeze: undefined }));
+    const rows = sel.r, cols = sel.c;
+    updateSheet((s) => ({ ...s, freeze: rows || cols ? { rows, cols } : { rows: 1, cols: 0 } }));
+  };
+
+  // ---- Tìm & thay thế ----
+  const matches = useMemo(() => (find?.q && sheet && engine ? findMatches(sheet, engine, active, find.q) : []), [find?.q, sheet, engine, active]);
+  const gotoMatch = (i: number) => {
+    if (!matches.length || !find) return;
+    const n = ((i % matches.length) + matches.length) % matches.length;
+    setFind({ ...find, idx: n });
+    setSel(selectCell(matches[n][0], matches[n][1]));
+  };
+  const replaceOne = () => {
+    if (!find || !sheet || !matches.length) return;
+    const [r, c] = matches[Math.min(find.idx, matches.length - 1)];
+    const next = replaceInCell(sheet.cells[key(r, c)], find.q, find.repl);
+    if (next) setCells([[r, c, next]]);
+    else gotoMatch(find.idx + 1);
+  };
+  const replaceAll = () => {
+    if (!find || !sheet) return;
+    const out: [number, number, Cell | undefined][] = [];
+    for (const [r, c] of matches) {
+      const next = replaceInCell(sheet.cells[key(r, c)], find.q, find.repl);
+      if (next) out.push([r, c, next]);
+    }
+    if (out.length) setCells(out);
+    setNotice(out.length ? `Đã thay ${out.length} ô.` : 'Không có ô nào để thay (ô công thức chỉ thay khi chữ nằm trong công thức).');
   };
 
   const save = async (saveAs = false) => {
@@ -297,44 +400,72 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
     for (let c = 0; c < (sheet?.colCount ?? 0); c++) xs.push(xs[c] + (sheet?.colWidths[c] ?? DEFAULT_W));
     return xs;
   }, [sheet?.colWidths, sheet?.colCount]);
+  const rowY = useMemo(() => {
+    const ys = [0];
+    for (let r = 0; r < (sheet?.rowCount ?? 0); r++) ys.push(ys[r] + (sheet?.rowHeights?.[r] ?? ROW_H));
+    return ys;
+  }, [sheet?.rowHeights, sheet?.rowCount]);
+  const rowH = (r: number) => sheet?.rowHeights?.[r] ?? ROW_H;
+  const FR = Math.min(sheet?.freeze?.rows ?? 0, (sheet?.rowCount ?? 1) - 1);
+  const FC = Math.min(sheet?.freeze?.cols ?? 0, (sheet?.colCount ?? 1) - 1);
+  const frozenH = rowY[FR] ?? 0, frozenW = colX[FC] ?? 0;
+  /** Ô gộp: ô chính → vùng; ô bị che → true. */
+  const mergeInfo = useMemo(() => {
+    const masters = new Map<string, Merge>();
+    const covered = new Set<string>();
+    for (const m of sheet?.merges ?? []) {
+      masters.set(key(m.r0, m.c0), m);
+      for (let r = m.r0; r <= m.r1; r++) for (let c = m.c0; c <= m.c1; c++) covered.add(key(r, c));
+    }
+    return { masters, covered };
+  }, [sheet?.merges]);
 
   // Giữ ô đang chọn trong khung nhìn.
   useEffect(() => {
     const el = gridRef.current;
     if (!el || !sheet) return;
     const r = sel.r2, c = sel.c2;
-    const top = r * ROW_H, bottom = top + ROW_H, left = colX[c] ?? 0, right = colX[c + 1] ?? left + DEFAULT_W;
-    if (top < el.scrollTop) el.scrollTop = top;
-    else if (bottom > el.scrollTop + el.clientHeight) el.scrollTop = bottom - el.clientHeight;
-    if (left < el.scrollLeft) el.scrollLeft = left;
-    else if (right > el.scrollLeft + el.clientWidth) el.scrollLeft = right - el.clientWidth;
+    const top = rowY[r] ?? 0, bottom = rowY[r + 1] ?? top + ROW_H, left = colX[c] ?? 0, right = colX[c + 1] ?? left + DEFAULT_W;
+    // Phần cố định che mất frozenH/frozenW phía trên/trái của khung cuộn.
+    if (r >= FR) {
+      if (top - frozenH < el.scrollTop) el.scrollTop = top - frozenH;
+      else if (bottom > el.scrollTop + el.clientHeight) el.scrollTop = bottom - el.clientHeight;
+    }
+    if (c >= FC) {
+      if (left - frozenW < el.scrollLeft) el.scrollLeft = left - frozenW;
+      else if (right > el.scrollLeft + el.clientWidth) el.scrollLeft = right - el.clientWidth;
+    }
     if (sheet && (r >= sheet.rowCount - 5 || c >= sheet.colCount - 2)) {
       setBook((b) => b && ({ sheets: b.sheets.map((s, i) => i === active ? { ...s, rowCount: Math.max(s.rowCount, r + 50), colCount: Math.max(s.colCount, c + 10) } : s) }));
     }
   }, [sel.r2, sel.c2]);
 
-  const firstRow = Math.floor(scroll.y / ROW_H);
-  const lastRow = Math.min((sheet?.rowCount ?? 0) - 1, Math.ceil((scroll.y + scroll.h) / ROW_H));
-  let firstCol = 0;
-  while (firstCol < colX.length - 2 && colX[firstCol + 1] < scroll.x) firstCol++;
-  let lastCol = firstCol;
-  while (lastCol < colX.length - 2 && colX[lastCol] < scroll.x + scroll.w) lastCol++;
+  const firstRow = indexAt(rowY, scroll.y);
+  const lastRow = Math.min((sheet?.rowCount ?? 0) - 1, indexAt(rowY, scroll.y + scroll.h) + 1);
+  const firstCol = indexAt(colX, scroll.x);
+  const lastCol = Math.min((sheet?.colCount ?? 0) - 1, indexAt(colX, scroll.x + scroll.w) + 1);
 
   const dragging = useRef(false);
   const resizing = useRef<{ c: number; x: number; w: number } | null>(null);
+  const resizingRow = useRef<{ r: number; y: number; h: number } | null>(null);
 
   const cellFromEvent = (e: React.PointerEvent) => {
-    const rect = gridRef.current!.getBoundingClientRect();
-    const x = e.clientX - rect.left + gridRef.current!.scrollLeft;
-    const y = e.clientY - rect.top + gridRef.current!.scrollTop;
-    let c = 0;
-    while (c < colX.length - 2 && colX[c + 1] <= x) c++;
-    return { r: Math.max(0, Math.floor(y / ROW_H)), c };
+    const el = gridRef.current!;
+    const rect = el.getBoundingClientRect();
+    const vx = e.clientX - rect.left, vy = e.clientY - rect.top;
+    const x = FC && vx < frozenW ? vx : vx + el.scrollLeft;
+    const y = FR && vy < frozenH ? vy : vy + el.scrollTop;
+    return { r: indexAt(rowY, Math.max(0, y)), c: indexAt(colX, Math.max(0, x)) };
   };
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); save(); }
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); save(); }
+      if (mod && (e.key.toLowerCase() === 'f' || e.key.toLowerCase() === 'h')) {
+        e.preventDefault();
+        setFind((f) => ({ q: f?.q ?? '', repl: f?.repl ?? '', idx: 0, replace: e.key.toLowerCase() === 'h' || !!f?.replace }));
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -398,6 +529,73 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
   const { r0, r1, c0, c1 } = norm(sel);
   const s = activeCell?.s ?? {};
   const barText = editing ? editing.text : rawText(activeCell);
+  const activeMerge = mergeInfo.masters.get(key(sel.r, sel.c));
+  const activeW = activeMerge ? colX[activeMerge.c1 + 1] - colX[activeMerge.c0] : colW(sel.c);
+  const activeH = activeMerge ? rowY[activeMerge.r1 + 1] - rowY[activeMerge.r0] : rowH(sel.r);
+  const range = (a: number, b: number) => (b < a ? [] : Array.from({ length: b - a + 1 }, (_, i) => a + i));
+
+  /** Vẽ một ô (ô chính của vùng gộp thì phủ cả vùng). `opaque`: nền trắng để che phần cuộn bên dưới vùng cố định. */
+  const renderCell = (r: number, c: number, opaque = false) => {
+    const k = key(r, c);
+    const m = mergeInfo.masters.get(k);
+    const cell = sheet.cells[k];
+    const value = cell ? (cell.f ? engine.evaluate(active, r, c) : cell.v) : null;
+    const st = cell?.s;
+    const isNum = typeof value === 'number';
+    const isErr = !!value && typeof value === 'object';
+    const b = st?.border;
+    const shadows = [b?.t && 'inset 0 1px 0 #000', b?.l && 'inset 1px 0 0 #000'].filter(Boolean).join(',');
+    const inSel = opaque && r >= r0 && r <= r1 && c >= c0 && c <= c1;
+    return (
+      <div key={k} className={`xl-cell${isErr ? ' err' : ''}${st?.wrap ? ' wrap' : ''}${m ? ' merged' : ''}${inSel ? ' insel' : ''}`} style={{
+        left: colX[c], top: rowY[r],
+        width: m ? colX[m.c1 + 1] - colX[m.c0] : colW(c), height: m ? rowY[m.r1 + 1] - rowY[m.r0] : rowH(r),
+        lineHeight: m || st?.wrap ? undefined : `${rowH(r) - 1}px`,
+        fontWeight: st?.bold ? 700 : undefined, fontStyle: st?.italic ? 'italic' : undefined,
+        textDecoration: st?.underline ? 'underline' : undefined, color: st?.color,
+        background: st?.fill ?? (opaque || m ? '#fff' : undefined),
+        borderRightColor: b?.r ? '#000' : undefined, borderBottomColor: b?.b ? '#000' : undefined,
+        boxShadow: shadows || undefined,
+        textAlign: st?.align ?? (isNum ? 'right' : typeof value === 'boolean' || isErr ? 'center' : 'left'),
+        justifyContent: st?.align === 'center' ? 'center' : st?.align === 'right' || (!st?.align && isNum) ? 'flex-end' : undefined,
+      }}>
+        {m || st?.wrap ? <span>{formatValue(value, st?.numFmt)}</span> : formatValue(value, st?.numFmt)}
+      </div>
+    );
+  };
+
+  /** Các ô của một khối hàng × cột, bỏ ô bị gộp che; ô gộp vẽ một lần qua ô chính. */
+  const renderBlock = (rows: number[], cols: number[], opaque = false) => {
+    const out: JSX.Element[] = [];
+    for (const r of rows) for (const c of cols) if (!mergeInfo.covered.has(key(r, c))) out.push(renderCell(r, c, opaque));
+    const ra = rows[0], rb = rows[rows.length - 1], ca = cols[0], cb = cols[cols.length - 1];
+    if (ra === undefined || ca === undefined) return out;
+    // Vùng gộp được vẽ ở khối (cố định hàng?, cố định cột?) chứa ô chính, kể cả khi ô chính đã cuộn khỏi khung nhìn.
+    const frozenRows = ra < FR, frozenCols = ca < FC;
+    for (const m of sheet.merges ?? []) {
+      if (m.r1 < ra || m.r0 > rb || m.c1 < ca || m.c0 > cb) continue;
+      if ((m.r0 < FR) === frozenRows && (m.c0 < FC) === frozenCols) out.push(renderCell(m.r0, m.c0, opaque));
+    }
+    return out;
+  };
+
+  /** Khung vùng chọn và ô hiện hành, cắt theo khối (để vẽ lại trong vùng cố định). */
+  const renderSel = (ra: number, rb: number, ca: number, cb: number) => {
+    const sr0 = Math.max(r0, ra), sr1 = Math.min(r1, rb), sc0 = Math.max(c0, ca), sc1 = Math.min(c1, cb);
+    const showActive = sel.r >= ra && sel.r <= rb && sel.c >= ca && sel.c <= cb;
+    return (
+      <>
+        {sr0 <= sr1 && sc0 <= sc1 && (
+          <div className="xl-sel" style={{ left: colX[sc0], top: rowY[sr0], width: colX[sc1 + 1] - colX[sc0], height: rowY[sr1 + 1] - rowY[sr0] }} />
+        )}
+        {showActive && <div className="xl-active" style={{ left: colX[sel.c], top: rowY[sel.r], width: activeW, height: activeH }} />}
+      </>
+    );
+  };
+
+  const visRows = range(Math.max(firstRow, FR), lastRow), visCols = range(Math.max(firstCol, FC), lastCol);
+  const frRows = range(0, FR - 1), frCols = range(0, FC - 1);
+  const inFrozen = (r: number, c: number) => r < FR || c < FC;
 
   return (
     <EditorShell
@@ -423,10 +621,13 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
           <label className="tb-field" title="Màu nền ô"><span className="tb-mini">▮</span>
             <input type="color" value={s.fill ?? '#ffffff'} onChange={(e) => applyStyle({ fill: e.target.value })} /></label>
           <ToolButton icon="∅" label="Bỏ màu nền" onClick={() => applyStyle({ fill: undefined })} />
+          <ToolButton icon="▦" label={fullBorder(s) ? 'Bỏ kẻ khung' : 'Kẻ khung'} active={fullBorder(s)} onClick={toggleBorder} />
           <Sep />
           <ToolButton icon="⇤" label="Căn trái" active={s.align === 'left'} onClick={() => applyStyle({ align: 'left' })} />
           <ToolButton icon="↔" label="Căn giữa" active={s.align === 'center'} onClick={() => applyStyle({ align: 'center' })} />
           <ToolButton icon="⇥" label="Căn phải" active={s.align === 'right'} onClick={() => applyStyle({ align: 'right' })} />
+          <ToolButton icon="↵" label="Xuống dòng" active={!!s.wrap} onClick={() => applyStyle({ wrap: !s.wrap || undefined })} />
+          <ToolButton icon="⊞" label={activeMerge ? 'Bỏ gộp ô' : 'Gộp ô'} active={!!activeMerge} onClick={toggleMerge} />
           <label className="tb-field" title="Định dạng số">
             <select value={s.numFmt ?? 'General'} onChange={(e) => applyStyle({ numFmt: e.target.value === 'General' ? undefined : e.target.value })}>
               {NUM_FORMATS.map(([f, l]) => <option key={f} value={f}>{l}</option>)}
@@ -437,6 +638,8 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
           <ToolButton icon="Σ" label="Tự động tính tổng" onClick={autoSum} />
           <ToolButton icon="A↓" label="Sắp xếp tăng" onClick={() => sort(true)} />
           <ToolButton icon="Z↓" label="Sắp xếp giảm" onClick={() => sort(false)} />
+          <ToolButton icon="🔍" label="Tìm & thay" active={!!find} onClick={() => setFind(find ? null : { q: '', repl: '', idx: 0, replace: true })} />
+          <ToolButton icon="❄" label={sheet.freeze ? 'Bỏ cố định' : 'Cố định'} active={!!sheet.freeze} onClick={toggleFreeze} />
           <Sep />
           <ToolButton icon="+≡" label="Chèn hàng" onClick={() => shift('row', 1)} />
           <ToolButton icon="−≡" label="Xoá hàng" onClick={() => shift('row', -1)} />
@@ -444,11 +647,32 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
           <ToolButton icon="−‖" label="Xoá cột" onClick={() => shift('col', -1)} />
         </>
       }
-      status={stats || `${sheet.name} · ${addr(sel.r, sel.c)}`}
+      status={notice || stats || `${sheet.name} · ${addr(sel.r, sel.c)}${sheet.freeze ? ` · Cố định ${FR} hàng, ${FC} cột` : ''}`}
     >
       <div className="xl">
+        {find && (
+          <form className="xl-find" onSubmit={(e) => { e.preventDefault(); gotoMatch(find.idx + (matches.length && sel.r === matches[find.idx]?.[0] && sel.c === matches[find.idx]?.[1] ? 1 : 0)); }}>
+            <input autoFocus placeholder="Tìm trong trang tính…" value={find.q}
+              onChange={(e) => { setFind({ ...find, q: e.target.value, idx: 0 }); setNotice(null); }}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') { setFind(null); gridRef.current?.focus(); }
+                if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.form?.requestSubmit(); }
+              }} />
+            <span className="xl-find-count">{find.q ? (matches.length ? `${Math.min(find.idx, matches.length - 1) + 1}/${matches.length}` : 'Không thấy') : ''}</span>
+            <button type="button" className="btn" onClick={() => gotoMatch(find.idx - 1)} disabled={!matches.length} title="Kết quả trước">‹</button>
+            <button type="button" className="btn" onClick={() => gotoMatch(find.idx + 1)} disabled={!matches.length} title="Kết quả sau">›</button>
+            {find.replace && (
+              <>
+                <input placeholder="Thay bằng…" value={find.repl} onChange={(e) => setFind({ ...find, repl: e.target.value })} />
+                <button type="button" className="btn" onClick={replaceOne} disabled={!matches.length}>Thay</button>
+                <button type="button" className="btn" onClick={replaceAll} disabled={!matches.length}>Thay tất cả</button>
+              </>
+            )}
+            <button type="button" className="icon-btn" onClick={() => { setFind(null); setNotice(null); gridRef.current?.focus(); }} title="Đóng">✕</button>
+          </form>
+        )}
         <div className="xl-bar">
-          <span className="xl-addr">{r0 === r1 && c0 === c1 ? addr(sel.r, sel.c) : `${addr(r0, c0)}:${addr(r1, c1)}`}</span>
+          <span className="xl-addr">{r0 === r1 && c0 === c1 || activeMerge ? addr(sel.r, sel.c) : `${addr(r0, c0)}:${addr(r1, c1)}`}</span>
           <span className="xl-fx">fx</span>
           <input
             className="xl-formula"
@@ -463,8 +687,9 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
           <div className="xl-corner" onClick={() => setSel({ r: 0, c: 0, r2: sheet.rowCount - 1, c2: sheet.colCount - 1 })} />
           <div className="xl-colhead" style={{ left: HEAD_W, height: HEAD_H }}>
             <div style={{ transform: `translateX(${-scroll.x}px)`, position: 'relative', height: HEAD_H }}>
-              {Array.from({ length: lastCol - firstCol + 1 }, (_, i) => firstCol + i).map((c) => (
-                <div key={c} className={`xl-hcell${c >= c0 && c <= c1 ? ' on' : ''}`} style={{ left: colX[c], width: colW(c) }}
+              {[...frCols, ...visCols].map((c) => (
+                <div key={c} className={`xl-hcell${c >= c0 && c <= c1 ? ' on' : ''}${c < FC ? ' frz' : ''}`}
+                  style={{ left: colX[c] + (c < FC ? scroll.x : 0), width: colW(c) }}
                   onPointerDown={(e) => { if (!(e.target as HTMLElement).dataset.resize) setSel(e.shiftKey ? { ...sel, c2: c, r: 0, r2: sheet.rowCount - 1 } : { r: 0, c, r2: sheet.rowCount - 1, c2: c }); }}>
                   {colName(c)}
                   <span className="xl-resize" data-resize="1"
@@ -482,10 +707,20 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
           </div>
           <div className="xl-rowhead" style={{ top: HEAD_H, width: HEAD_W }}>
             <div style={{ transform: `translateY(${-scroll.y}px)`, position: 'relative' }}>
-              {Array.from({ length: Math.max(0, lastRow - firstRow + 1) }, (_, i) => firstRow + i).map((r) => (
-                <div key={r} className={`xl-rcell${r >= r0 && r <= r1 ? ' on' : ''}`} style={{ top: r * ROW_H, height: ROW_H }}
-                  onPointerDown={(e) => setSel(e.shiftKey ? { ...sel, r2: r, c: 0, c2: sheet.colCount - 1 } : { r, c: 0, r2: r, c2: sheet.colCount - 1 })}>
+              {[...frRows, ...visRows].map((r) => (
+                <div key={r} className={`xl-rcell${r >= r0 && r <= r1 ? ' on' : ''}${r < FR ? ' frz' : ''}`}
+                  style={{ top: rowY[r] + (r < FR ? scroll.y : 0), height: rowH(r) }}
+                  onPointerDown={(e) => { if (!(e.target as HTMLElement).dataset.resize) setSel(e.shiftKey ? { ...sel, r2: r, c: 0, c2: sheet.colCount - 1 } : { r, c: 0, r2: r, c2: sheet.colCount - 1 }); }}>
                   {r + 1}
+                  <span className="xl-rresize" data-resize="1"
+                    onPointerDown={(e) => { e.stopPropagation(); (e.target as HTMLElement).setPointerCapture(e.pointerId); resizingRow.current = { r, y: e.clientY, h: rowH(r) }; }}
+                    onPointerMove={(e) => {
+                      const rz = resizingRow.current;
+                      if (!rz) return;
+                      const h = Math.max(12, rz.h + e.clientY - rz.y);
+                      setBook((b) => b && ({ sheets: b.sheets.map((sh, i) => i === active ? { ...sh, rowHeights: { ...sh.rowHeights, [rz.r]: h } } : sh) }));
+                    }}
+                    onPointerUp={() => { if (resizingRow.current) setDirty(true); resizingRow.current = null; }} />
                 </div>
               ))}
             </div>
@@ -505,10 +740,10 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
               const { r, c } = cellFromEvent(e);
               if (editing) commitEdit();
               if (e.shiftKey) setSel({ ...sel, r2: r, c2: c });
-              else if (e.pointerType !== 'mouse' && r === sel.r && c === sel.c && r0 === r1 && c0 === c1) {
+              else if (e.pointerType !== 'mouse' && (r === sel.r && c === sel.c || mergeAt(sheet.merges, r, c) === activeMerge && activeMerge) && (r0 === r1 && c0 === c1 || activeMerge)) {
                 setEditing({ text: rawText(activeCell), inBar: false });
                 return;
-              } else setSel({ r, c, r2: r, c2: c });
+              } else setSel(selectCell(r, c));
               if (e.pointerType === 'mouse') {
                 dragging.current = true;
                 gridRef.current!.setPointerCapture(e.pointerId);
@@ -522,34 +757,41 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
             onPointerUp={() => (dragging.current = false)}
             onDoubleClick={() => setEditing({ text: rawText(activeCell), inBar: false })}
           >
-            <div style={{ width: colX[colX.length - 1], height: sheet.rowCount * ROW_H, position: 'relative' }}>
-              {Array.from({ length: Math.max(0, lastRow - firstRow + 1) }, (_, i) => firstRow + i).flatMap((r) =>
-                Array.from({ length: lastCol - firstCol + 1 }, (_, j) => firstCol + j).map((c) => {
-                  const cell = sheet.cells[key(r, c)];
-                  const value = cell ? (cell.f ? engine.evaluate(active, r, c) : cell.v) : null;
-                  const st = cell?.s;
-                  const isNum = typeof value === 'number';
-                  const isErr = !!value && typeof value === 'object';
-                  return (
-                    <div key={`${r},${c}`} className={`xl-cell${isErr ? ' err' : ''}`} style={{
-                      left: colX[c], top: r * ROW_H, width: colW(c), height: ROW_H,
-                      fontWeight: st?.bold ? 700 : undefined, fontStyle: st?.italic ? 'italic' : undefined,
-                      textDecoration: st?.underline ? 'underline' : undefined, color: st?.color, background: st?.fill,
-                      textAlign: st?.align ?? (isNum ? 'right' : typeof value === 'boolean' || isErr ? 'center' : 'left'),
-                    }}>
-                      {formatValue(value, st?.numFmt)}
-                    </div>
-                  );
-                }),
+            <div style={{ width: colX[colX.length - 1], height: rowY[rowY.length - 1], position: 'relative' }}>
+              {renderBlock(visRows, visCols)}
+              {renderSel(0, sheet.rowCount, 0, sheet.colCount)}
+              {FR > 0 && (
+                <div className="xl-frz-top" style={{ zIndex: 2 }}>
+                  {renderBlock(frRows, visCols, true)}
+                  {renderSel(0, FR - 1, FC, sheet.colCount)}
+                  <div className="xl-frz-line h" style={{ top: frozenH - 1, left: 0, width: colX[colX.length - 1] }} />
+                </div>
               )}
-              <div className="xl-sel" style={{ left: colX[c0], top: r0 * ROW_H, width: colX[c1 + 1] - colX[c0], height: (r1 - r0 + 1) * ROW_H }} />
-              <div className="xl-active" style={{ left: colX[sel.c], top: sel.r * ROW_H, width: colW(sel.c), height: ROW_H }} />
+              {FC > 0 && (
+                <div className="xl-frz-left" style={{ zIndex: 2 }}>
+                  {renderBlock(visRows, frCols, true)}
+                  {renderSel(FR, sheet.rowCount, 0, FC - 1)}
+                  <div className="xl-frz-line v" style={{ left: frozenW - 1, top: 0, height: rowY[rowY.length - 1] }} />
+                </div>
+              )}
+              {FR > 0 && FC > 0 && (
+                <div className="xl-frz-corner" style={{ zIndex: 3 }}>
+                  {renderBlock(frRows, frCols, true)}
+                  {renderSel(0, FR - 1, 0, FC - 1)}
+                </div>
+              )}
               {editing && !editing.inBar && (
-                <input
+                <textarea
                   className="xl-editor"
                   autoFocus
                   value={editing.text}
-                  style={{ left: colX[sel.c], top: sel.r * ROW_H, minWidth: colW(sel.c), height: ROW_H }}
+                  rows={1}
+                  style={{
+                    left: colX[sel.c] + (inFrozen(sel.r, sel.c) && sel.c < FC ? scroll.x : 0),
+                    top: rowY[sel.r] + (inFrozen(sel.r, sel.c) && sel.r < FR ? scroll.y : 0),
+                    minWidth: activeW, height: Math.max(activeH, ROW_H),
+                  }}
+                  onFocus={(e) => { const t = e.currentTarget; t.setSelectionRange(t.value.length, t.value.length); }}
                   onChange={(e) => setEditing({ text: e.target.value, inBar: false })}
                   onKeyDown={onEditKey}
                   onBlur={() => commitEdit()}

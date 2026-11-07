@@ -3,7 +3,9 @@ import * as pdfjs from 'pdfjs-dist';
 import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { OpenedFile, pickFile, saveFile } from '../../lib/fileio';
-import { Annot, applyAnnotations, deletePage, insertBlankPage, mergePdf, movePage, rotatePage } from './pdfOps';
+import {
+  Annot, FieldValues, applyAnnotations, deletePage, extractPages, insertBlankPage, mergePdf, movePage, parsePageRanges, rotatePage,
+} from './pdfOps';
 import { SignaturePad } from './SignaturePad';
 import { EditorShell, ToolButton, Sep } from '../../components/EditorShell';
 import { uid } from '../../lib/uid';
@@ -18,6 +20,52 @@ if (typeof FontFace !== 'undefined') {
 
 type Tool = 'select' | 'text' | 'highlight' | 'rect' | 'whiteout' | 'ink' | 'place';
 type Size = { w: number; h: number };
+/** Vị trí một kết quả tìm kiếm (pt, gốc trên-trái của trang). w = 0 khi chỉ biết trang. */
+type Hit = { page: number; x: number; y: number; w: number; h: number };
+/** Ô của biểu mẫu PDF (AcroForm) cần hiển thị để điền. */
+interface Field {
+  id: string; page: number; name: string; kind: 'text' | 'check' | 'radio' | 'choice';
+  x: number; y: number; w: number; h: number;
+  multiline?: boolean; readOnly?: boolean; options?: string[]; onValue?: string; maxLen?: number;
+}
+
+/** Chuẩn hoá để tìm kiếm không phân biệt hoa thường, dạng dựng sẵn/tổ hợp của dấu tiếng Việt. */
+const fold = (t: string) => t.normalize('NFC').toLocaleLowerCase('vi');
+
+/** Đọc các trường biểu mẫu của tài liệu qua pdf.js: vị trí từng ô và giá trị hiện tại. */
+async function readFields(d: PDFDocumentProxy): Promise<{ fields: Field[]; values: FieldValues }> {
+  const fields: Field[] = [];
+  const values: FieldValues = {};
+  for (let i = 1; i <= d.numPages; i++) {
+    const page = await d.getPage(i);
+    const vp = page.getViewport({ scale: 1 });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    for (const a of (await page.getAnnotations()) as any[]) {
+      if (a.subtype !== 'Widget' || !a.fieldName || a.hidden) continue;
+      const [x1, y1, x2, y2] = vp.convertToViewportRectangle(a.rect);
+      const box = { x: Math.min(x1, x2), y: Math.min(y1, y2), w: Math.abs(x2 - x1), h: Math.abs(y2 - y1) };
+      const base = { id: a.id ?? `${i}-${fields.length}`, page: i - 1, name: a.fieldName as string, readOnly: !!a.readOnly, ...box };
+      if (a.fieldType === 'Tx') {
+        fields.push({ ...base, kind: 'text', multiline: !!a.multiLine, maxLen: a.maxLen || undefined });
+        values[base.name] ??= typeof a.fieldValue === 'string' ? a.fieldValue : '';
+      } else if (a.fieldType === 'Btn' && a.checkBox) {
+        fields.push({ ...base, kind: 'check', onValue: a.exportValue });
+        values[base.name] ??= !!a.fieldValue && a.fieldValue !== 'Off';
+      } else if (a.fieldType === 'Btn' && a.radioButton) {
+        fields.push({ ...base, kind: 'radio', onValue: a.buttonValue });
+        if (a.fieldValue && a.fieldValue !== 'Off') values[base.name] = a.fieldValue;
+        else values[base.name] ??= '';
+      } else if (a.fieldType === 'Ch') {
+        const opts = (a.options ?? []) as { exportValue: string; displayValue: string }[];
+        const cur = Array.isArray(a.fieldValue) ? a.fieldValue[0] : a.fieldValue;
+        fields.push({ ...base, kind: 'choice', options: opts.map((o) => o.displayValue ?? o.exportValue) });
+        const hit = opts.find((o) => o.exportValue === cur || o.displayValue === cur);
+        values[base.name] ??= hit ? hit.displayValue ?? hit.exportValue : (cur ?? '');
+      }
+    }
+  }
+  return { fields, values };
+}
 
 const MIN_ZOOM = 0.2, MAX_ZOOM = 5;
 const clampZoom = (z: number) => +Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z)).toFixed(3);
@@ -53,8 +101,12 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
   const [dirty, setDirty] = useState(false);
   const [path, setPath] = useState(file.path);
   const [query, setQuery] = useState('');
-  const [hits, setHits] = useState<number[] | null>(null);
+  const [hits, setHits] = useState<Hit[] | null>(null);
   const [hitIdx, setHitIdx] = useState(0);
+  const [fields, setFields] = useState<Field[]>([]);
+  const [formInit, setFormInit] = useState<FieldValues>({});
+  const [formEdits, setFormEdits] = useState<FieldValues>({});
+  const [curPage, setCurPage] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const pagesRef = useRef<HTMLDivElement>(null);
   const fitted = useRef(false);
@@ -152,7 +204,10 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
           const vp = (await d.getPage(i)).getViewport({ scale: 1 });
           s.push({ w: vp.width, h: vp.height });
         }
+        const form = await readFields(d).catch(() => ({ fields: [] as Field[], values: {} as FieldValues }));
         if (cancelled) return d.destroy();
+        setFields(form.fields);
+        setFormInit(form.values);
         if (!fitted.current) {
           fitted.current = true;
           setZoom(fitZoom(s));
@@ -207,17 +262,18 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
   /** Thao tác trang: làm phẳng chú thích hiện có trước rồi mới biến đổi trang. */
   const pageOp = (label: string, op: (b: Uint8Array) => Promise<Uint8Array>) =>
     run(label, async () => {
-      const flat = annots.length ? await applyAnnotations(bytes, annots) : bytes;
+      const flat = annots.length || Object.keys(formEdits).length ? await applyAnnotations(bytes, annots, undefined, formEdits) : bytes;
       const out = await op(flat);
       snapshot();
       setAnnots([]);
+      setFormEdits({});
       setSelected(null);
       setBytes(out);
     });
 
   const save = (saveAs = false) =>
     run('Đang lưu…', async () => {
-      const out = await applyAnnotations(bytes, annots);
+      const out = await applyAnnotations(bytes, annots, undefined, formEdits);
       const p = await saveFile({ name: file.name, kind: 'pdf', path }, out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer, saveAs);
       if (p) setPath(p);
       setDirty(false);
@@ -257,18 +313,101 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
     scrollRef.current?.querySelector(`[data-page="${i}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
+  /** Cuộn để kết quả tìm kiếm nằm khoảng 1/3 phía trên khung nhìn. */
+  const showHit = (h: Hit) => {
+    const el = scrollRef.current;
+    const pageEl = el?.querySelector(`[data-page="${h.page}"]`);
+    if (!el || !pageEl) return;
+    if (!h.w) return scrollToPage(h.page);
+    const pr = pageEl.getBoundingClientRect(), sr = el.getBoundingClientRect();
+    el.scrollTo({
+      top: el.scrollTop + pr.top - sr.top + h.y * zoom - el.clientHeight / 3,
+      left: el.scrollLeft + pr.left - sr.left + h.x * zoom - el.clientWidth / 3,
+      behavior: 'smooth',
+    });
+  };
+
+  /** Tìm chữ trong mọi trang, lấy vị trí từng kết quả để tô sáng. */
   const search = async () => {
     if (!doc || !query.trim()) return setHits(null);
-    const q = query.trim().toLowerCase();
-    const found: number[] = [];
+    const q = fold(query.trim());
+    const found: Hit[] = [];
     for (let i = 1; i <= doc.numPages; i++) {
-      const tc = await (await doc.getPage(i)).getTextContent();
-      const text = tc.items.map((it) => ('str' in it ? it.str : '')).join(' ').toLowerCase();
-      if (text.includes(q)) found.push(i - 1);
+      const page = await doc.getPage(i);
+      const vp = page.getViewport({ scale: 1 });
+      const tc = await page.getTextContent();
+      let onPage = 0;
+      const parts: string[] = [];
+      for (const it of tc.items) {
+        if (!('str' in it) || !it.str) continue;
+        parts.push(it.str);
+        const s = fold(it.str);
+        let idx = s.indexOf(q);
+        if (idx < 0) continue;
+        const t = pdfjs.Util.transform(vp.transform, it.transform);
+        const fh = Math.hypot(t[2], t[3]) || 10;
+        while (idx >= 0) {
+          found.push({ page: i - 1, x: t[4] + (it.width * idx) / s.length, y: t[5] - fh * 0.9, w: (it.width * q.length) / s.length, h: fh * 1.15 });
+          onPage++;
+          idx = s.indexOf(q, idx + q.length);
+        }
+      }
+      // Cụm từ bị tách qua nhiều đoạn chữ: chỉ biết trang chứa nó.
+      if (!onPage && fold(parts.join('')).replace(/\s+/g, ' ').includes(q.replace(/\s+/g, ' '))) found.push({ page: i - 1, x: 0, y: 0, w: 0, h: 0 });
     }
     setHits(found);
     setHitIdx(0);
-    if (found.length) scrollToPage(found[0]);
+    if (found.length) showHit(found[0]);
+  };
+  const stepHit = (d: number) => {
+    if (!hits?.length) return;
+    const n = (hitIdx + d + hits.length) % hits.length;
+    setHitIdx(n);
+    showHit(hits[n]);
+  };
+
+  // Theo dõi trang đang xem để hiện "trang x / n".
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    let raf = 0;
+    const onScroll = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        const mid = el.getBoundingClientRect().top + el.clientHeight / 2;
+        const pages = el.querySelectorAll<HTMLElement>('[data-page]');
+        for (const p of pages) {
+          const r = p.getBoundingClientRect();
+          if (r.bottom >= mid) { setCurPage(Number(p.dataset.page)); break; }
+        }
+      });
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => { el.removeEventListener('scroll', onScroll); cancelAnimationFrame(raf); };
+  }, []);
+
+  const goToPage = () => {
+    const v = prompt(`Đi tới trang (1–${sizes.length})`, String(curPage + 1));
+    const n = Number(v);
+    if (v && Number.isInteger(n) && n >= 1 && n <= sizes.length) scrollToPage(n - 1);
+  };
+
+  const extract = () => {
+    const spec = prompt(`Nhập các trang cần trích ra tệp mới, ví dụ: 1-3, 5 (tài liệu có ${sizes.length} trang)`, `${curPage + 1}`);
+    if (!spec) return;
+    run('Đang trích trang…', async () => {
+      const idx = parsePageRanges(spec, sizes.length);
+      const flat = await applyAnnotations(bytes, annots, undefined, formEdits);
+      const out = await extractPages(flat, idx);
+      const base = file.name.replace(/\.pdf$/i, '');
+      await saveFile({ name: `${base} (trang ${spec.replace(/\s+/g, '')}).pdf`, kind: 'pdf' }, out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer, true);
+    });
+  };
+
+  const formValue = (name: string) => (name in formEdits ? formEdits[name] : formInit[name]);
+  const setFormValue = (name: string, v: string | boolean) => {
+    setFormEdits((f) => ({ ...f, [name]: v }));
+    setDirty(true);
   };
 
   const pickImage = () => {
@@ -342,6 +481,7 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
           <ToolButton icon="⇔" label="Vừa khung" onClick={() => zoomTo(fitZoom())} />
           <Sep />
           <ToolButton icon="▤" label="Trang" active={showThumbs} onClick={() => setShowThumbs((v) => !v)} />
+          <ToolButton icon="⎘" label="Trích trang" onClick={extract} />
           <ToolButton icon="⊕" label="Gộp PDF" onClick={() => run('Đang gộp…', async () => {
             const other = await pickFile();
             if (!other) return;
@@ -350,20 +490,17 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
           })} />
           <form className="tb-search" onSubmit={(e) => { e.preventDefault(); search(); }}>
             <input placeholder="Tìm trong PDF…" value={query} onChange={(e) => setQuery(e.target.value)} />
-            {hits && (
-              <button type="button" className="tb-hits" onClick={() => {
-                if (!hits.length) return;
-                const n = (hitIdx + 1) % hits.length;
-                setHitIdx(n);
-                scrollToPage(hits[n]);
-              }}>
-                {hits.length ? `Trang ${hits[hitIdx] + 1} (${hitIdx + 1}/${hits.length}) ›` : 'Không thấy'}
-              </button>
-            )}
+            {hits && (hits.length ? (
+              <>
+                <button type="button" className="tb-hits" onClick={() => stepHit(-1)} title="Kết quả trước">‹</button>
+                <span className="tb-hits">{hitIdx + 1}/{hits.length} · tr.{hits[hitIdx].page + 1}</span>
+                <button type="button" className="tb-hits" onClick={() => stepHit(1)} title="Kết quả sau">›</button>
+              </>
+            ) : <span className="tb-hits">Không thấy</span>)}
           </form>
         </>
       }
-      status={`${sizes.length} trang · ${hint ?? ''}`}
+      status={`${sizes.length} trang${fields.length ? ` · ${new Set(fields.map((f) => f.name)).size} ô biểu mẫu (bấm vào ô để điền)` : ''} · ${hint ?? ''}`}
     >
       <div className="pdf-body">
         {showThumbs && doc && (
@@ -371,7 +508,7 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
             {sizes.map((s, i) => (
               <div key={i} className="thumb">
                 <button className="thumb-img" onClick={() => scrollToPage(i)} title={`Trang ${i + 1}`}>
-                  <PdfCanvas doc={doc} index={i} zoom={110 / s.w} size={s} />
+                  <PdfCanvas doc={doc} index={i} zoom={110 / s.w} size={s} forms={false} />
                 </button>
                 <div className="thumb-actions">
                   <span>{i + 1}</span>
@@ -393,7 +530,14 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
           <div className="pdf-pages" ref={pagesRef}>
           {doc && sizes.map((s, i) => (
             <div key={i} className="pdf-page" data-page={i} style={{ width: s.w * zoom, height: s.h * zoom }}>
-              <PdfCanvas doc={doc} index={i} zoom={zoom} size={s} />
+              <PdfCanvas doc={doc} index={i} zoom={zoom} size={s} forms={fields.length > 0} />
+              {hits?.some((h) => h.page === i && h.w) && (
+                <div className="pdf-hits">
+                  {hits.map((h, k) => h.page === i && h.w ? (
+                    <span key={k} className={k === hitIdx ? 'cur' : ''} style={{ left: h.x * zoom, top: h.y * zoom, width: h.w * zoom, height: h.h * zoom }} />
+                  ) : null)}
+                </div>
+              )}
               <AnnotLayer
                 page={i}
                 size={s}
@@ -409,12 +553,17 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
                 onUpdate={updateAnnot}
                 onBeginChange={snapshot}
               />
+              {fields.some((f) => f.page === i) && (
+                <FormLayer fields={fields.filter((f) => f.page === i)} zoom={zoom} active={tool === 'select'}
+                  value={formValue} onChange={setFormValue} />
+              )}
             </div>
           ))}
           </div>
         </div>
         {doc && (
           <div className="zoom-float" role="group" aria-label="Thu phóng">
+            <button className="zoom-pct" onClick={goToPage} title="Đi tới trang">{curPage + 1}/{sizes.length}</button>
             <button onClick={() => zoomTo(zoom / 1.25)} title="Thu nhỏ" aria-label="Thu nhỏ">−</button>
             <button className="zoom-pct" onClick={() => zoomTo(fitZoom())} title="Vừa khung">{Math.round(zoom * 100)}%</button>
             <button onClick={() => zoomTo(zoom * 1.25)} title="Phóng to" aria-label="Phóng to">+</button>
@@ -443,7 +592,9 @@ const MAX_CANVAS_PIXELS = 4_000_000;
 type Region = { x: number; y: number; w: number; h: number };
 
 /** Vẽ một trang PDF lên canvas khi trang xuất hiện trong khung nhìn. */
-function PdfCanvas({ doc, index, zoom, size }: { doc: PDFDocumentProxy; index: number; zoom: number; size: Size }) {
+function PdfCanvas({ doc, index, zoom, size, forms }: { doc: PDFDocumentProxy; index: number; zoom: number; size: Size; forms: boolean }) {
+  // Có biểu mẫu: không vẽ ô biểu mẫu lên canvas vì ô nhập phía trên đã hiển thị giá trị đang điền.
+  const annotationMode = forms ? pdfjs.AnnotationMode.ENABLE_FORMS : pdfjs.AnnotationMode.ENABLE;
   const ref = useRef<HTMLCanvasElement>(null);
   const detailRef = useRef<HTMLCanvasElement>(null);
   const [visible, setVisible] = useState(false);
@@ -479,14 +630,14 @@ function PdfCanvas({ doc, index, zoom, size }: { doc: PDFDocumentProxy; index: n
       const canvas = ref.current;
       canvas.width = Math.floor(vp.width);
       canvas.height = Math.floor(vp.height);
-      task = page.render({ canvasContext: canvas.getContext('2d')!, viewport: vp });
+      task = page.render({ canvasContext: canvas.getContext('2d')!, viewport: vp, annotationMode });
       task.promise.catch(() => {});
     });
     return () => {
       cancelled = true;
       task?.cancel();
     };
-  }, [doc, index, baseScale, visible]);
+  }, [doc, index, baseScale, visible, annotationMode]);
 
   // Theo dõi phần trang đang nằm trong khung cuộn để vẽ nét phần đó.
   useEffect(() => {
@@ -539,7 +690,7 @@ function PdfCanvas({ doc, index, zoom, size }: { doc: PDFDocumentProxy; index: n
       const tmp = document.createElement('canvas');
       tmp.width = Math.ceil(region.w * dpr);
       tmp.height = Math.ceil(region.h * dpr);
-      task = page.render({ canvasContext: tmp.getContext('2d')!, viewport: vp });
+      task = page.render({ canvasContext: tmp.getContext('2d')!, viewport: vp, annotationMode });
       task.promise
         .then(() => {
           if (cancelled || !detailRef.current) return;
@@ -557,7 +708,7 @@ function PdfCanvas({ doc, index, zoom, size }: { doc: PDFDocumentProxy; index: n
       cancelled = true;
       task?.cancel();
     };
-  }, [doc, index, region, want, needDetail]);
+  }, [doc, index, region, want, needDetail, annotationMode]);
 
   const detailOk = needDetail && shown && shown.zoom === zoom;
   return (
@@ -569,6 +720,47 @@ function PdfCanvas({ doc, index, zoom, size }: { doc: PDFDocumentProxy; index: n
         style={detailOk ? { left: shown.x, top: shown.y, width: shown.w, height: shown.h } : { display: 'none' }}
       />
     </>
+  );
+}
+
+/** Ô nhập phủ lên các trường biểu mẫu của trang để điền trực tiếp. */
+function FormLayer({ fields, zoom, active, value, onChange }: {
+  fields: Field[]; zoom: number; active: boolean;
+  value(name: string): string | boolean | undefined; onChange(name: string, v: string | boolean): void;
+}) {
+  return (
+    <div className={`form-layer${active ? '' : ' off'}`}>
+      {fields.map((f) => {
+        const style = { left: f.x * zoom, top: f.y * zoom, width: f.w * zoom, height: f.h * zoom };
+        const fs = Math.max(8, Math.min(f.multiline ? 12 : f.h * 0.68, 14)) * zoom;
+        const v = value(f.name);
+        if (f.kind === 'check' || f.kind === 'radio') {
+          const on = f.kind === 'check' ? !!v : v === f.onValue;
+          return (
+            <button key={f.id} type="button" className={`form-box ${f.kind}${on ? ' on' : ''}`} style={style} disabled={f.readOnly}
+              title={f.name} aria-pressed={on}
+              onClick={() => onChange(f.name, f.kind === 'check' ? !on : on ? '' : f.onValue ?? '')}>
+              <span style={{ fontSize: Math.min(f.w, f.h) * zoom * 0.8 }}>{on ? (f.kind === 'check' ? '✓' : '●') : ''}</span>
+            </button>
+          );
+        }
+        if (f.kind === 'choice') {
+          return (
+            <select key={f.id} className="form-field" style={{ ...style, fontSize: fs }} disabled={f.readOnly} title={f.name}
+              value={String(v ?? '')} onChange={(e) => onChange(f.name, e.target.value)}>
+              <option value="" />
+              {f.options?.map((o) => <option key={o} value={o}>{o}</option>)}
+            </select>
+          );
+        }
+        const common = {
+          className: 'form-field', style: { ...style, fontSize: fs }, readOnly: f.readOnly, title: f.name,
+          maxLength: f.maxLen, value: String(v ?? ''),
+          onChange: (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => onChange(f.name, e.target.value),
+        };
+        return f.multiline ? <textarea key={f.id} {...common} /> : <input key={f.id} {...common} />;
+      })}
+    </div>
   );
 }
 

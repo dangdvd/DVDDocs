@@ -1,5 +1,8 @@
 // Các thao tác chỉnh sửa PDF thuần (không phụ thuộc giao diện), dùng pdf-lib.
-import { PDFDocument, PDFFont, PDFPage, StandardFonts, degrees, rgb } from 'pdf-lib';
+import {
+  PDFCheckBox, PDFDocument, PDFDropdown, PDFFont, PDFName, PDFOptionList, PDFPage, PDFRadioGroup, PDFTextField,
+  StandardFonts, degrees, rgb,
+} from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 
 /** Toạ độ "hiển thị" tính theo điểm (pt) ở tỉ lệ 1, gốc góc trên-trái của trang đã xoay. */
@@ -59,20 +62,54 @@ function dataUrlBytes(dataUrl: string): { bytes: Uint8Array; png: boolean } {
   return { bytes, png: head.includes('png') };
 }
 
-/** Ghi (làm phẳng) các chú thích vào nội dung PDF. */
+/** Giá trị trường biểu mẫu: chữ (ô nhập, danh sách, nút chọn một) hoặc đúng/sai (ô đánh dấu). */
+export type FieldValues = Record<string, string | boolean>;
+
+/** Điền giá trị vào các trường biểu mẫu (AcroForm). Trường không tồn tại hoặc giá trị không hợp lệ được bỏ qua. */
+async function fillFields(doc: PDFDocument, fields: FieldValues, getFont: () => Promise<PDFFont>) {
+  const form = doc.getForm();
+  let text = false;
+  for (const [name, val] of Object.entries(fields)) {
+    try {
+      const f = form.getField(name);
+      if (f instanceof PDFTextField) { f.setText(String(val)); text = true; }
+      else if (f instanceof PDFCheckBox) val ? f.check() : f.uncheck();
+      else if (f instanceof PDFRadioGroup) {
+        const v = String(val);
+        if (!v) f.clear();
+        else if (f.getOptions().includes(v)) f.select(v);
+        // pdf.js trả về tên trạng thái của nút (ví dụ "0", "1") thay vì nhãn lựa chọn.
+        else f.acroField.setValue(PDFName.of(v));
+      }
+      else if (f instanceof PDFDropdown || f instanceof PDFOptionList) { if (val) f.select(String(val)); else f.clear(); }
+    } catch {
+      /* trường lạ hoặc giá trị không nằm trong danh sách: bỏ qua */
+    }
+  }
+  // Vẽ lại hình hiển thị của trường bằng phông có dấu tiếng Việt.
+  if (text) form.updateFieldAppearances(await getFont());
+}
+
+/** Ghi (làm phẳng) các chú thích và điền biểu mẫu vào nội dung PDF. */
 export async function applyAnnotations(
   bytes: Uint8Array,
   annots: Annot[],
   fontBytes?: ArrayBuffer | null,
+  fields?: FieldValues,
 ): Promise<Uint8Array> {
   const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
-  if (annots.length === 0) return doc.save();
+  const hasFields = !!fields && Object.keys(fields).length > 0;
+  if (annots.length === 0 && !hasFields) return doc.save();
   let font: PDFFont | null = null;
-  if (annots.some((a) => a.type === 'text')) {
+  const getFont = async () => {
+    if (font) return font;
     doc.registerFontkit(fontkit);
     const fb = fontBytes === undefined ? await loadUnicodeFont() : fontBytes;
     font = fb ? await doc.embedFont(fb, { subset: true }) : await doc.embedFont(StandardFonts.Helvetica);
-  }
+    return font;
+  };
+  if (hasFields) await fillFields(doc, fields!, getFont);
+  if (annots.some((a) => a.type === 'text')) await getFont();
   const pages = doc.getPages();
   for (const a of annots) {
     const page = pages[a.page];
@@ -145,6 +182,30 @@ export async function mergePdf(bytes: Uint8Array, other: Uint8Array) {
   const src = await PDFDocument.load(other, { ignoreEncryption: true });
   const pages = await doc.copyPages(src, src.getPageIndices());
   pages.forEach((p) => doc.addPage(p));
+  return doc.save();
+}
+
+/** Đọc chuỗi trang kiểu "1-3, 5, 8-" (đánh số từ 1) thành danh sách chỉ số trang (từ 0), giữ thứ tự, bỏ trùng. */
+export function parsePageRanges(spec: string, count: number): number[] {
+  const out: number[] = [];
+  for (const part of spec.split(/[,;\s]+/).filter(Boolean)) {
+    const m = /^(\d*)\s*-\s*(\d*)$/.exec(part);
+    let a: number, b: number;
+    if (m) { a = m[1] ? Number(m[1]) : 1; b = m[2] ? Number(m[2]) : count; }
+    else if (/^\d+$/.test(part)) a = b = Number(part);
+    else throw new Error(`Không hiểu "${part}". Ví dụ hợp lệ: 1-3, 5`);
+    if (a < 1 || b > count || a > b) throw new Error(`Trang "${part}" nằm ngoài tài liệu (1–${count}).`);
+    for (let i = a; i <= b; i++) if (!out.includes(i - 1)) out.push(i - 1);
+  }
+  if (!out.length) throw new Error('Chưa nhập trang nào.');
+  return out;
+}
+
+/** Tạo PDF mới chỉ gồm các trang đã chọn. */
+export async function extractPages(bytes: Uint8Array, indices: number[]) {
+  const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  const doc = await PDFDocument.create();
+  (await doc.copyPages(src, indices)).forEach((p) => doc.addPage(p));
   return doc.save();
 }
 

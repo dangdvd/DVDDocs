@@ -178,7 +178,7 @@ button { font: inherit; color: inherit; }
 .xl-cell.err { color: var(--danger); }
 .xl-sel { position: absolute; background: rgba(31, 111, 235, .1); border: 1px solid var(--accent); pointer-events: none; }
 .xl-active { position: absolute; border: 2px solid var(--accent); pointer-events: none; }
-.xl-editor { position: absolute; z-index: 4; border: 2px solid var(--accent); outline: none; padding: 0 3px; font-size: 13px; font-family: Calibri, Arial, sans-serif; background: #fff; color: #111; box-shadow: 0 2px 8px rgba(0, 0, 0, .2); }
+.xl-editor { position: absolute; z-index: 5; resize: none; line-height: 22px; overflow: hidden; white-space: pre; border: 2px solid var(--accent); outline: none; padding: 0 3px; font-size: 13px; font-family: Calibri, Arial, sans-serif; background: #fff; color: #111; box-shadow: 0 2px 8px rgba(0, 0, 0, .2); }
 .xl-tabs { display: flex; gap: 2px; border-top: 1px solid var(--border); padding: 0 6px calc(env(safe-area-inset-bottom)); overflow-x: auto; flex-shrink: 0; background: var(--bg); }
 .xl-tab { border: 0; background: transparent; padding: 7px 14px; cursor: pointer; font-size: .85rem; white-space: nowrap; border-bottom: 3px solid transparent; }
 .xl-tab.on { background: var(--panel); border-bottom-color: var(--xlsx); font-weight: 600; color: var(--xlsx); }
@@ -196,3 +196,39 @@ button { font: inherit; color: inherit; }
   .docx-page { box-shadow: none; padding: 0; width: auto; min-height: 0; zoom: 1 !important; }
   html, body, #root, .editor, .editor-main { height: auto; overflow: visible; }
 }
+.pdf-hits { position: absolute; inset: 0; pointer-events: none; z-index: 1; }
+.pdf-hits span { position: absolute; background: rgba(255, 196, 0, .4); border-radius: 2px; }
+.pdf-hits span.cur { background: rgba(255, 120, 0, .55); outline: 2px solid #f57c00; }
+.form-layer { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+.form-layer > * { pointer-events: auto; }
+.form-layer.off > * { pointer-events: none; opacity: .7; }
+.form-field { position: absolute; box-sizing: border-box; border: 1px solid rgba(31, 111, 235, .35); background: rgba(221, 232, 255, .55); color: #111; padding: 0 2px; margin: 0; font-family: 'DejaVu Sans', Arial, sans-serif; outline: none; resize: none; border-radius: 0; }
+.form-field:focus { border-color: var(--accent); background: rgba(255, 255, 255, .92); }
+textarea.form-field { padding-top: 1px; line-height: 1.2; }
+.form-box { position: absolute; box-sizing: border-box; border: 1px solid rgba(31, 111, 235, .45); background: rgba(221, 232, 255, .55); color: #111; padding: 0; display: flex; align-items: center; justify-content: center; cursor: pointer; line-height: 1; }
+.form-box.radio { border-radius: 50%; }
+.form-box:focus-visible { outline: 2px solid var(--accent); }
+
+.xl-cell.merged, .xl-cell.wrap { display: flex; align-items: center; }
+.xl-cell.merged > span, .xl-cell.wrap > span { width: 100%; overflow: hidden; }
+.xl-cell.wrap > span { white-space: pre-wrap; word-break: break-word; line-height: 1.25; }
+.xl-hcell.frz, .xl-rcell.frz { background: #e4e7ec; z-index: 1; }
+.xl-rresize { position: absolute; left: 0; bottom: -4px; width: 100%; height: 8px; cursor: row-resize; z-index: 1; touch-action: none; }
+.xl-frz-top { position: sticky; top: 0; height: 0; }
+.xl-frz-left { position: sticky; left: 0; width: 0; height: 0; }
+.xl-frz-corner { position: sticky; top: 0; left: 0; width: 0; height: 0; }
+.xl-frz-line { position: absolute; background: #9aa3ae; pointer-events: none; }
+.xl-frz-line.h { height: 2px; }
+.xl-frz-line.v { width: 2px; }
+.xl-find { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--border); background: var(--bg); flex-wrap: wrap; flex-shrink: 0; }
+.xl-find input { height: 32px; border-radius: 6px; border: 1px solid var(--border); padding: 0 8px; min-width: 0; flex: 1 1 140px; max-width: 260px; background: var(--panel); color: var(--text); font: inherit; }
+.xl-find .btn { padding: 5px 10px; }
+.xl-find-count { font-size: .8rem; color: var(--muted); min-width: 52px; }
+.docx-page.landscape { width: 1123px; min-height: 794px; }
+.docx-page .ProseMirror .page-break { position: relative; height: 0; border-top: 1px dashed #9aa3ae; margin: 22px -40px; break-after: page; page-break-after: always; }
+.docx-page .ProseMirror .page-break::after { content: 'Ngắt trang'; position: absolute; left: 50%; top: -9px; transform: translateX(-50%); background: #fff; color: #667085; font-size: 11px; padding: 0 8px; }
+.docx-page .ProseMirror .page-break.ProseMirror-selectednode { border-top-color: var(--accent); }
+.docx-page .ProseMirror a { color: #0563c1; text-decoration: underline; }
+.search-hit { background: rgba(255, 196, 0, .45); border-radius: 2px; }
+.search-hit.cur { background: rgba(255, 120, 0, .6); outline: 1px solid #f57c00; }
+@media print { .docx-page .ProseMirror .page-break { border: 0; margin: 0; } .docx-page .ProseMirror .page-break::after { display: none; } .search-hit { background: none; outline: 0; } .xl-find { display: none !important; } }

@@ -9,7 +9,14 @@ export interface CellStyle {
   fill?: string; // #RRGGBB
   align?: 'left' | 'center' | 'right';
   numFmt?: string;
+  /** Viền mảnh theo từng cạnh: trên, phải, dưới, trái. */
+  border?: { t?: boolean; r?: boolean; b?: boolean; l?: boolean };
+  /** Xuống dòng trong ô. */
+  wrap?: boolean;
 }
+
+/** Vùng ô gộp (chỉ số từ 0, bao gồm cả hai đầu). */
+export interface Merge { r0: number; c0: number; r1: number; c1: number }
 
 export interface Cell {
   /** Giá trị nhập (khi không phải công thức). */
@@ -24,8 +31,13 @@ export interface Sheet {
   name: string;
   cells: Record<string, Cell>;
   colWidths: Record<number, number>; // px
+  /** Chiều cao hàng tuỳ chỉnh (px). */
+  rowHeights?: Record<number, number>;
   rowCount: number;
   colCount: number;
+  merges?: Merge[];
+  /** Số hàng phía trên và số cột bên trái được cố định khi cuộn. */
+  freeze?: { rows: number; cols: number };
 }
 
 export interface Book { sheets: Sheet[] }
@@ -218,6 +230,71 @@ export class Engine {
     this.cache.set(id, res);
     return res;
   }
+}
+
+/** Vùng gộp chứa ô (r, c), nếu có. */
+export function mergeAt(merges: Merge[] | undefined, r: number, c: number): Merge | undefined {
+  return merges?.find((m) => r >= m.r0 && r <= m.r1 && c >= m.c0 && c <= m.c1);
+}
+
+/** "A1:C2" → vùng gộp. */
+export function parseRange(ref: string): Merge | null {
+  const m = /^\$?([A-Z]+)\$?(\d+)(?::\$?([A-Z]+)\$?(\d+))?$/i.exec(ref.trim());
+  if (!m) return null;
+  const a = { r: Number(m[2]) - 1, c: colIndex(m[1]) };
+  const b = m[3] ? { r: Number(m[4]) - 1, c: colIndex(m[3]) } : a;
+  return { r0: Math.min(a.r, b.r), c0: Math.min(a.c, b.c), r1: Math.max(a.r, b.r), c1: Math.max(a.c, b.c) };
+}
+
+export const rangeRef = (m: Merge) => `${addr(m.r0, m.c0)}:${addr(m.r1, m.c1)}`;
+
+/**
+ * Dịch một đoạn [a0, a1] khi chèn (delta > 0) hoặc xoá (delta < 0) hàng/cột tại vị trí `at`.
+ * Trả về null nếu đoạn bị xoá hết.
+ */
+export function shiftSpan(a0: number, a1: number, at: number, delta: number): [number, number] | null {
+  if (delta > 0) return [a0 >= at ? a0 + delta : a0, a1 >= at ? a1 + delta : a1];
+  const end = at - delta; // các vị trí [at, end) bị xoá
+  const map = (p: number, start: boolean) => (p < at ? p : p >= end ? p + delta : start ? at : at - 1);
+  const n0 = map(a0, true), n1 = map(a1, false);
+  return n1 < n0 ? null : [n0, n1];
+}
+
+/** Dịch các vùng gộp khi chèn/xoá hàng hoặc cột; bỏ vùng chỉ còn một ô. */
+export function shiftMerges(merges: Merge[] | undefined, axis: 'row' | 'col', at: number, delta: number): Merge[] | undefined {
+  if (!merges?.length) return merges;
+  const out: Merge[] = [];
+  for (const m of merges) {
+    const span = axis === 'row' ? shiftSpan(m.r0, m.r1, at, delta) : shiftSpan(m.c0, m.c1, at, delta);
+    if (!span) continue;
+    const n = axis === 'row' ? { ...m, r0: span[0], r1: span[1] } : { ...m, c0: span[0], c1: span[1] };
+    if (n.r1 > n.r0 || n.c1 > n.c0) out.push(n);
+  }
+  return out;
+}
+
+/** Văn bản hiển thị để tìm kiếm: công thức thì lấy kết quả, kèm cả chữ gốc. */
+export function findMatches(sheet: Sheet, engine: Engine, si: number, query: string): [number, number][] {
+  const q = query.normalize('NFC').toLocaleLowerCase('vi');
+  if (!q) return [];
+  const out: [number, number][] = [];
+  for (const k in sheet.cells) {
+    const cell = sheet.cells[k];
+    const [r, c] = parseKey(k);
+    const shown = formatValue(cell.f ? engine.evaluate(si, r, c) : cell.v, cell.s?.numFmt);
+    const hay = `${shown}\u0000${rawText(cell)}`.normalize('NFC').toLocaleLowerCase('vi');
+    if (hay.includes(q)) out.push([r, c]);
+  }
+  return out.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+}
+
+/** Thay chữ trong nội dung gốc của ô (không phân biệt hoa thường). Trả về null nếu không đổi. */
+export function replaceInCell(cell: Cell, query: string, repl: string): Cell | null {
+  const raw = rawText(cell);
+  const esc = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const next = raw.normalize('NFC').replace(new RegExp(esc.normalize('NFC'), 'gi'), () => repl);
+  if (next === raw.normalize('NFC')) return null;
+  return { ...parseInput(next), s: cell.s };
 }
 
 export function emptySheet(name: string, id: string): Sheet {
