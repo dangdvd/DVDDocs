@@ -1,8 +1,19 @@
 // Chuyển nội dung trình soạn thảo (JSON của TipTap/ProseMirror) sang tệp .docx thật bằng thư viện `docx`.
 import {
-  AlignmentType, BorderStyle, Document, ExternalHyperlink, HeadingLevel, ImageRun, LevelFormat, Packer,
-  Paragraph, ParagraphChild, ShadingType, Table, TableCell, TableRow, TextRun, WidthType,
+  AlignmentType, BorderStyle, Document, ExternalHyperlink, Footer, HeadingLevel, ImageRun, LevelFormat, Packer,
+  PageBreak, PageNumber, PageOrientation, Paragraph, ParagraphChild, ShadingType, Table, TableCell, TableRow, TextRun, WidthType,
 } from 'docx';
+
+/** Thiết lập trang khi xuất: khổ ngang và đánh số trang ở chân trang. */
+export interface PageSetup { landscape: boolean; pageNumbers: boolean }
+
+/** "12pt" | "16px" | "1.5em" → nửa điểm (đơn vị cỡ chữ của Word), hoặc undefined. */
+export function halfPoints(size?: string | null): number | undefined {
+  const m = /^([\d.]+)\s*(pt|px)?$/i.exec(String(size ?? '').trim());
+  if (!m) return undefined;
+  const pt = m[2]?.toLowerCase() === 'px' ? Number(m[1]) * 0.75 : Number(m[1]);
+  return pt > 0 ? Math.round(pt * 2) : undefined;
+}
 
 export interface PMNode {
   type: string;
@@ -78,7 +89,9 @@ class Converter {
       } else if (n.type === 'text' && n.text) {
         const marks = n.marks ?? [];
         const has = (t: string) => marks.find((m) => m.type === t);
-        const color = toHex(has('textStyle')?.attrs?.color);
+        const ts = has('textStyle')?.attrs;
+        const color = toHex(ts?.color);
+        const family = (ts?.fontFamily as string | undefined)?.replace(/["']/g, '').split(',')[0].trim();
         const hl = has('highlight');
         const link = has('link');
         const run = new TextRun({
@@ -88,7 +101,10 @@ class Converter {
           underline: has('underline') || link ? {} : undefined,
           strike: !!has('strike'),
           color: color ?? (link ? '0563C1' : undefined),
-          font: has('code') ? 'Courier New' : undefined,
+          font: has('code') ? 'Courier New' : family || undefined,
+          size: halfPoints(ts?.fontSize),
+          superScript: !!has('superscript'),
+          subScript: !!has('subscript'),
           shading: hl ? { type: ShadingType.CLEAR, color: 'auto', fill: toHex(hl.attrs?.color) ?? 'FFFF00' } : undefined,
         });
         out.push(link?.attrs?.href ? new ExternalHyperlink({ link: link.attrs.href, children: [run] }) : run);
@@ -148,6 +164,9 @@ class Converter {
             }));
           }
           break;
+        case 'pageBreak':
+          out.push(new Paragraph({ children: [new PageBreak()] }));
+          break;
         case 'horizontalRule':
           out.push(new Paragraph({ children: [], border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: '999999', space: 1 } } }));
           break;
@@ -183,7 +202,7 @@ class Converter {
   }
 }
 
-export function buildDocument(json: PMNode): Document {
+export function buildDocument(json: PMNode, setup: PageSetup = { landscape: false, pageNumbers: false }): Document {
   const conv = new Converter();
   const children = conv.blocks(json.content);
   const fmts = [LevelFormat.DECIMAL, LevelFormat.LOWER_LETTER, LevelFormat.LOWER_ROMAN];
@@ -202,10 +221,23 @@ export function buildDocument(json: PMNode): Document {
         })),
       }],
     },
-    sections: [{ children: children.length ? children : [new Paragraph({ children: [] })] }],
+    sections: [{
+      properties: setup.landscape ? { page: { size: { orientation: PageOrientation.LANDSCAPE } } } : undefined,
+      footers: setup.pageNumbers
+        ? {
+          default: new Footer({
+            children: [new Paragraph({
+              alignment: AlignmentType.CENTER,
+              children: [new TextRun({ children: ['Trang ', PageNumber.CURRENT, ' / ', PageNumber.TOTAL_PAGES], size: 18 })],
+            })],
+          }),
+        }
+        : undefined,
+      children: children.length ? children : [new Paragraph({ children: [] })],
+    }],
   });
 }
 
-export async function exportDocx(json: PMNode): Promise<ArrayBuffer> {
-  return Packer.toArrayBuffer(buildDocument(json));
+export async function exportDocx(json: PMNode, setup?: PageSetup): Promise<ArrayBuffer> {
+  return Packer.toArrayBuffer(buildDocument(json, setup));
 }
