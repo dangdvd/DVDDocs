@@ -7,8 +7,10 @@ import {
   moveFormula, parseInput, parseKey, rawText, replaceInCell, shiftFormula, shiftMerges, shiftSpan, usedRange,
 } from './sheetModel';
 import { CHART_KINDS, Chart, ChartKind, chartData, chartFromRange } from './charts';
+import { CF_KINDS, CfKind, CfRule, Filter, cfEvaluator, columnValues, filterHidden } from './cf';
 import ChartView from './ChartView';
 import { LoadedBook, loadXlsx, saveXlsx } from './xlsxIO';
+import { csvToBook } from './csv';
 
 const ROW_H = 24;
 const DEFAULT_W = 96;
@@ -52,17 +54,30 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState<string | null>(isNew ? null : 'Đang mở…');
   const [error, setError] = useState<string | null>(null);
-  const [path, setPath] = useState(file.path);
-  const [name, setName] = useState(file.name);
+  const isCsv = /\.(csv|tsv)$/i.test(file.name);
+  // CSV được lưu thành .xlsx (giữ được định dạng, công thức, nhiều trang): lưu lần đầu hỏi nơi lưu mới.
+  const [path, setPath] = useState(isCsv ? undefined : file.path);
+  const [name, setName] = useState(isCsv ? file.name.replace(/\.(csv|tsv)$/i, '.xlsx') : file.name);
   const clip = useRef<{ text: string; r: number; c: number; cells: (Cell | undefined)[][] } | null>(null);
   const [find, setFind] = useState<{ q: string; repl: string; idx: number; replace: boolean } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [selChart, setSelChart] = useState<string | null>(null);
+  const hiddenRef = useRef<Record<number, boolean>>({});
+  /** Bảng chọn giá trị lọc của một cột. */
+  const [fpop, setFpop] = useState<{ c: number; q: string; hide: Set<string> } | null>(null);
+  /** Hộp thoại định dạng có điều kiện. */
+  const [cfDlg, setCfDlg] = useState<{ kind: CfKind; a: string; b: string; fill: string; color: string; c1: string; c2: string; c3: string; three: boolean } | null>(null);
   const chartDrag = useRef<{ id: string; mode: 'move' | 'size'; x: number; y: number; moved: boolean } | null>(null);
   const [chartOff, setChartOff] = useState<{ id: string; dx: number; dy: number; mode: 'move' | 'size' } | null>(null);
 
   useEffect(() => {
     if (isNew) return;
+    if (isCsv) {
+      try { setBook(csvToBook(file.data, file.name, uid())); setNotice('Tệp CSV sẽ được lưu thành bảng tính .xlsx'); }
+      catch (e) { setError(`Không đọc được tệp CSV: ${(e as Error).message}`); }
+      setBusy(null);
+      return;
+    }
     loadXlsx(file.data)
       .then((l) => { loaded.current = l; setBook(l.book); })
       .catch((e) => setError(`Không mở được tệp Excel: ${e.message ?? e}`))
@@ -134,11 +149,17 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
 
   const moveSel = (dr: number, dc: number, extend = false) => {
     setSel((s) => {
-      if (extend) return { ...s, r2: Math.max(0, s.r2 + dr), c2: Math.max(0, s.c2 + dc) };
+      if (extend) {
+        let r2 = Math.max(0, s.r2 + dr);
+        while (dr && r2 > 0 && hiddenRef.current[r2]) r2 += dr > 0 ? 1 : -1;
+        return { ...s, r2, c2: Math.max(0, s.c2 + dc) };
+      }
       const cur = mergeAt(sheet?.merges, s.r, s.c);
       let r = s.r + dr, c = s.c + dc;
       if (cur && dr > 0) r = cur.r1 + 1;
       if (cur && dc > 0) c = cur.c1 + 1;
+      // Bỏ qua hàng đang ẩn (do lọc hoặc ẩn thủ công).
+      while (dr && r > 0 && hiddenRef.current[r]) r += dr > 0 ? 1 : -1;
       return selectCell(Math.max(0, r), Math.max(0, c));
     });
   };
@@ -283,8 +304,31 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
           const anchor = axis === 'row' ? { ...a, r0: span[0], r1: span[1] + 1 } : { ...a, c0: span[0], c1: span[1] + 1 };
           return [{ ...ch, anchor }];
         });
+        const sp = (a0: number, a1: number) => shiftSpan(a0, a1, at, d);
+        const cf = s.cf?.flatMap((x) => {
+          const span = axis === 'row' ? sp(x.range.r0, x.range.r1) : sp(x.range.c0, x.range.c1);
+          if (!span) return [];
+          return [{ ...x, range: axis === 'row' ? { ...x.range, r0: span[0], r1: span[1] } : { ...x.range, c0: span[0], c1: span[1] } }];
+        });
+        let filter = s.filter;
+        if (filter) {
+          const span = axis === 'row' ? sp(filter.r, filter.r1) : sp(filter.c0, filter.c1);
+          const headDeleted = axis === 'row' && d < 0 && filter.r >= at && filter.r < at - d;
+          if (!span || headDeleted) filter = undefined;
+          else if (axis === 'row') filter = { ...filter, r: span[0], r1: span[1] };
+          else {
+            const hide: Record<number, string[]> = {};
+            for (const [ci, v] of Object.entries(filter.hide)) { const n = sp(Number(ci), Number(ci)); if (n) hide[n[0]] = v; }
+            filter = { ...filter, c0: span[0], c1: span[1], hide };
+          }
+        }
+        let hiddenRows = s.hiddenRows;
+        if (axis === 'row' && hiddenRows) {
+          hiddenRows = {};
+          for (const ri of Object.keys(s.hiddenRows!)) { const n = sp(Number(ri), Number(ri)); if (n) hiddenRows[n[0]] = true; }
+        }
         return {
-          ...s, cells, colWidths, rowHeights, merges: shiftMerges(s.merges, axis, at, d), charts,
+          ...s, cells, colWidths, rowHeights, merges: shiftMerges(s.merges, axis, at, d), charts, cf, filter, hiddenRows,
           rowCount: s.rowCount + (axis === 'row' && d > 0 ? d : 0), colCount: s.colCount + (axis === 'col' && d > 0 ? d : 0),
         };
       }),
@@ -295,11 +339,19 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
     if (!sheet || !engine) return;
     let { r0, r1, c0, c1 } = norm(sel);
     if (r0 === r1) {
-      const u = usedRange(sheet);
-      r0 = 1; r1 = u.maxR; c0 = 0; c1 = u.maxC;
-      if (r1 < 1) return;
+      const f = sheet.filter;
+      if (f && sel.c >= f.c0 && sel.c <= f.c1) ({ r0, r1, c0, c1 } = { r0: f.r + 1, r1: f.r1, c0: f.c0, c1: f.c1 });
+      else {
+        const u = usedRange(sheet);
+        r0 = 1; r1 = u.maxR; c0 = 0; c1 = u.maxC;
+      }
+      if (r1 < r0) return;
     }
-    const col = sel.c;
+    sortRange(asc, { r0, r1, c0, c1 }, sel.c);
+  };
+
+  const sortRange = (asc: boolean, { r0, r1, c0, c1 }: { r0: number; r1: number; c0: number; c1: number }, col: number) => {
+    if (!sheet || !engine) return;
     const rows = [];
     for (let r = r0; r <= r1; r++) rows.push(r);
     const val = (r: number) => engine.valueAt(active, r, col);
@@ -360,6 +412,50 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
     if (sheet.freeze) return updateSheet((s) => ({ ...s, freeze: undefined }));
     const rows = sel.r, cols = sel.c;
     updateSheet((s) => ({ ...s, freeze: rows || cols ? { rows, cols } : { rows: 1, cols: 0 } }));
+  };
+
+  // ---- Lọc dữ liệu ----
+  const toggleFilter = () => {
+    const { r0, r1, c0, c1 } = norm(sel);
+    if (!sheet) return;
+    if (sheet.filter) return updateSheet((s) => ({ ...s, filter: undefined }));
+    const u = usedRange(sheet);
+    let f: Filter;
+    if (r0 !== r1 || c0 !== c1) f = { r: r0, r1: Math.min(r1, Math.max(u.maxR, r0 + 1)), c0, c1: Math.min(c1, Math.max(u.maxC, c0)), hide: {} };
+    else {
+      // Một ô: lấy vùng dữ liệu liền kề quanh ô, hàng đầu là tiêu đề.
+      let a = c0, b = c0;
+      const has = (r: number, c: number) => { const x = sheet.cells[key(r, c)]; return !!x && (x.f || (x.v !== null && x.v !== undefined && x.v !== '')); };
+      while (a > 0 && has(r0, a - 1)) a--;
+      while (has(r0, b + 1)) b++;
+      let end = r0;
+      const rowHas = (r: number) => { for (let c = a; c <= b; c++) if (has(r, c)) return true; return false; };
+      while (end < u.maxR && rowHas(end + 1)) end++;
+      f = { r: r0, c0: a, c1: b, r1: Math.max(end, r0 + 1), hide: {} };
+    }
+    updateSheet((s) => ({ ...s, filter: f }));
+  };
+
+  // ---- Định dạng có điều kiện ----
+  const openCf = () => setCfDlg({ kind: 'gt', a: '', b: '', fill: '#FFC7CE', color: '#9C0006', c1: '#F8696B', c2: '#FFEB84', c3: '#63BE7B', three: true });
+  const applyCf = () => {
+    const { r0, r1, c0, c1 } = norm(sel);
+    if (!cfDlg || !sheet) return;
+    const u = usedRange(sheet);
+    const range = { r0, c0, r1: Math.min(r1, Math.max(u.maxR, r0)), c1: Math.min(c1, Math.max(u.maxC, c0)) };
+    const d = cfDlg;
+    const rule: CfRule = d.kind === 'scale' ? { range, kind: 'scale', colors: d.three ? [d.c1, d.c2, d.c3] : [d.c1, d.c3] }
+      : d.kind === 'bar' ? { range, kind: 'bar', colors: [d.fill === '#FFC7CE' ? '#638EC6' : d.fill] }
+      : { range, kind: d.kind, a: d.a.trim(), b: d.kind === 'between' ? d.b.trim() : undefined, fill: d.fill || undefined, color: d.color || undefined };
+    updateSheet((s) => ({ ...s, cf: [...(s.cf ?? []), rule] }));
+    setCfDlg(null);
+  };
+  const selN = norm(sel);
+  const cfInSel = (sheet?.cf ?? []).filter((x) => !(x.range.r1 < selN.r0 || x.range.r0 > selN.r1 || x.range.c1 < selN.c0 || x.range.c0 > selN.c1));
+  const describeCf = (x: CfRule) => {
+    const label = CF_KINDS.find(([k]) => k === x.kind)?.[1] ?? 'Quy tắc khác';
+    const v = x.kind === 'between' ? ` ${x.a} – ${x.b}` : x.a ? ` ${x.a}` : '';
+    return `${addr(x.range.r0, x.range.c0)}:${addr(x.range.r1, x.range.c1)} · ${label}${v}`;
   };
 
   // ---- Tìm & thay thế ----
@@ -438,7 +534,7 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
     try {
       const out = await saveXlsx(book, loaded.current, (si, r, c) => engine.evaluate(si, r, c));
       const finalName = name.toLowerCase().endsWith('.xlsx') ? name : `${name}.xlsx`;
-      const p = await saveFile({ name: finalName, kind: 'xlsx', path }, out, saveAs || (isNew && !path));
+      const p = await saveFile({ name: finalName, kind: 'xlsx', path }, out, saveAs || ((isNew || isCsv) && !path));
       if (p) { setPath(p); setName(p.split(/[\\/]/).pop() ?? finalName); }
       setDirty(false);
     } catch (e) {
@@ -465,12 +561,19 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
     for (let c = 0; c < (sheet?.colCount ?? 0); c++) xs.push(xs[c] + (sheet?.colWidths[c] ?? DEFAULT_W));
     return xs;
   }, [sheet?.colWidths, sheet?.colCount]);
+  /** Hàng ẩn: ẩn thủ công và ẩn do lọc. */
+  const hidden = useMemo(() => {
+    if (!sheet || !engine) return {} as Record<number, boolean>;
+    return { ...(sheet.hiddenRows ?? {}), ...(sheet.filter ? filterHidden(sheet, engine, active, sheet.filter) : {}) };
+  }, [sheet, engine, active]);
+  hiddenRef.current = hidden;
+  const cfLook = useMemo(() => (sheet?.cf?.length && engine ? cfEvaluator(sheet, engine, active) : null), [sheet, engine, active]);
   const rowY = useMemo(() => {
     const ys = [0];
-    for (let r = 0; r < (sheet?.rowCount ?? 0); r++) ys.push(ys[r] + (sheet?.rowHeights?.[r] ?? ROW_H));
+    for (let r = 0; r < (sheet?.rowCount ?? 0); r++) ys.push(ys[r] + (hidden[r] ? 0 : sheet?.rowHeights?.[r] ?? ROW_H));
     return ys;
-  }, [sheet?.rowHeights, sheet?.rowCount]);
-  const rowH = (r: number) => sheet?.rowHeights?.[r] ?? ROW_H;
+  }, [sheet?.rowHeights, sheet?.rowCount, hidden]);
+  const rowH = (r: number) => (hidden[r] ? 0 : sheet?.rowHeights?.[r] ?? ROW_H);
   const FR = Math.min(sheet?.freeze?.rows ?? 0, (sheet?.rowCount ?? 1) - 1);
   const FC = Math.min(sheet?.freeze?.cols ?? 0, (sheet?.colCount ?? 1) - 1);
   const frozenH = rowY[FR] ?? 0, frozenW = colX[FC] ?? 0;
@@ -484,6 +587,9 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
     }
     return { masters, covered };
   }, [sheet?.merges]);
+
+  // Thông báo về tệp CSV chỉ hiện tới khi người dùng bắt đầu thao tác.
+  useEffect(() => { setNotice((n) => (n?.startsWith('Tệp CSV') ? null : n)); }, [sel]);
 
   // Giữ ô đang chọn trong khung nhìn.
   useEffect(() => {
@@ -613,20 +719,36 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
     const b = st?.border;
     const shadows = [b?.t && 'inset 0 1px 0 #000', b?.l && 'inset 1px 0 0 #000'].filter(Boolean).join(',');
     const inSel = opaque && r >= r0 && r <= r1 && c >= c0 && c <= c1;
+    const look = cfLook?.(r, c);
+    const flt = sheet.filter;
+    const fbtn = flt && r === flt.r && c >= flt.c0 && c <= flt.c1;
+    const bar = look?.bar;
     return (
       <div key={k} className={`xl-cell${isErr ? ' err' : ''}${st?.wrap ? ' wrap' : ''}${m ? ' merged' : ''}${inSel ? ' insel' : ''}`} style={{
         left: colX[c], top: rowY[r],
         width: m ? colX[m.c1 + 1] - colX[m.c0] : colW(c), height: m ? rowY[m.r1 + 1] - rowY[m.r0] : rowH(r),
         lineHeight: m || st?.wrap ? undefined : `${rowH(r) - 1}px`,
         fontWeight: st?.bold ? 700 : undefined, fontStyle: st?.italic ? 'italic' : undefined,
-        textDecoration: st?.underline ? 'underline' : undefined, color: st?.color,
-        background: st?.fill ?? (opaque || m ? '#fff' : undefined),
+        textDecoration: st?.underline ? 'underline' : undefined, color: look?.color ?? st?.color,
+        backgroundColor: look?.fill ?? st?.fill ?? (opaque || m ? '#fff' : undefined),
+        ...(bar ? {
+          backgroundImage: `linear-gradient(90deg, ${bar.color}, ${bar.color}55)`,
+          backgroundSize: `${Math.round(bar.pct * 100)}% 70%`, backgroundRepeat: 'no-repeat', backgroundPosition: 'left center',
+        } : {}),
+        paddingRight: fbtn ? 20 : undefined,
         borderRightColor: b?.r ? '#000' : undefined, borderBottomColor: b?.b ? '#000' : undefined,
         boxShadow: shadows || undefined,
         textAlign: st?.align ?? (isNum ? 'right' : typeof value === 'boolean' || isErr ? 'center' : 'left'),
         justifyContent: st?.align === 'center' ? 'center' : st?.align === 'right' || (!st?.align && isNum) ? 'flex-end' : undefined,
       }}>
         {m || st?.wrap ? <span>{formatValue(value, st?.numFmt)}</span> : formatValue(value, st?.numFmt)}
+        {fbtn && (
+          <button type="button" className={`xl-fbtn${flt.hide[c]?.length ? ' on' : ''}`} title="Lọc"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => { e.stopPropagation(); setFpop({ c, q: '', hide: new Set(flt.hide[c] ?? []) }); }}>
+            {flt.hide[c]?.length ? '⧩' : '▾'}
+          </button>
+        )}
       </div>
     );
   };
@@ -660,8 +782,8 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
     );
   };
 
-  const visRows = range(Math.max(firstRow, FR), lastRow), visCols = range(Math.max(firstCol, FC), lastCol);
-  const frRows = range(0, FR - 1), frCols = range(0, FC - 1);
+  const visRows = range(Math.max(firstRow, FR), lastRow).filter((r) => !hidden[r]), visCols = range(Math.max(firstCol, FC), lastCol);
+  const frRows = range(0, FR - 1).filter((r) => !hidden[r]), frCols = range(0, FC - 1);
   const inFrozen = (r: number, c: number) => r < FR || c < FC;
 
   return (
@@ -707,6 +829,8 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
           <ToolButton icon="Z↓" label="Sắp xếp giảm" onClick={() => sort(false)} />
           <ToolButton icon="🔍" label="Tìm & thay" active={!!find} onClick={() => setFind(find ? null : { q: '', repl: '', idx: 0, replace: true })} />
           <ToolButton icon="❄" label={sheet.freeze ? 'Bỏ cố định' : 'Cố định'} active={!!sheet.freeze} onClick={toggleFreeze} />
+          <ToolButton icon="⧩" label={sheet.filter ? 'Bỏ lọc' : 'Lọc dữ liệu'} active={!!sheet.filter} onClick={toggleFilter} />
+          <ToolButton icon="◧" label="Định dạng có điều kiện" active={cfInSel.length > 0} onClick={openCf} />
           <ToolButton icon="📊" label="Chèn biểu đồ" onClick={() => insertChart('col')} />
           {activeChart && (
             <>
@@ -968,6 +1092,100 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
           ))}
         </div>
       </div>
+      {fpop && sheet.filter && (() => {
+        const f = sheet.filter;
+        const all = columnValues(sheet, engine, active, f, fpop.c);
+        const q = fpop.q.toLocaleLowerCase('vi');
+        const shown = q ? all.filter((v) => v.toLocaleLowerCase('vi').includes(q)) : all;
+        const setHide = (hide: Set<string>) => setFpop({ ...fpop, hide });
+        const head = formatValue(engine.valueAt(active, f.r, fpop.c), sheet.cells[key(f.r, fpop.c)]?.s?.numFmt) || colName(fpop.c);
+        return (
+          <div className="modal-backdrop" onClick={() => setFpop(null)}>
+            <form className="modal xl-fpop" onClick={(e) => e.stopPropagation()} onSubmit={(e) => {
+              e.preventDefault();
+              const hide = [...fpop.hide].filter((v) => all.includes(v));
+              updateSheet((s) => s.filter ? ({ ...s, filter: { ...s.filter, hide: { ...s.filter.hide, [fpop.c]: hide } } }) : s);
+              setFpop(null);
+            }}>
+              <h3>Lọc cột “{head}”</h3>
+              <div className="xl-fpop-sort">
+                <button type="button" className="btn" onClick={() => { setFpop(null); sortRange(true, { r0: f.r + 1, r1: f.r1, c0: f.c0, c1: f.c1 }, fpop.c); }}>A→Z</button>
+                <button type="button" className="btn" onClick={() => { setFpop(null); sortRange(false, { r0: f.r + 1, r1: f.r1, c0: f.c0, c1: f.c1 }, fpop.c); }}>Z→A</button>
+              </div>
+              <input placeholder="Tìm giá trị…" value={fpop.q} onChange={(e) => setFpop({ ...fpop, q: e.target.value })} />
+              <label className="row"><input type="checkbox" checked={shown.every((v) => !fpop.hide.has(v))}
+                onChange={(e) => { const h = new Set(fpop.hide); shown.forEach((v) => (e.target.checked ? h.delete(v) : h.add(v))); setHide(h); }} /> (Chọn tất cả)</label>
+              <div className="xl-fpop-list">
+                {shown.map((v) => (
+                  <label key={v} className="row"><input type="checkbox" checked={!fpop.hide.has(v)}
+                    onChange={(e) => { const h = new Set(fpop.hide); if (e.target.checked) h.delete(v); else h.add(v); setHide(h); }} /> {v === '' ? '(Trống)' : v}</label>
+                ))}
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="btn" onClick={() => setHide(new Set())}>Bỏ lọc cột</button>
+                <span style={{ flex: 1 }} />
+                <button type="button" className="btn" onClick={() => setFpop(null)}>Huỷ</button>
+                <button type="submit" className="btn primary">Lọc</button>
+              </div>
+            </form>
+          </div>
+        );
+      })()}
+      {cfDlg && (
+        <div className="modal-backdrop" onClick={() => setCfDlg(null)}>
+          <form className="modal xl-cfdlg" onClick={(e) => e.stopPropagation()} onSubmit={(e) => { e.preventDefault(); applyCf(); }}>
+            <h3>Định dạng có điều kiện</h3>
+            <p className="muted">Áp dụng cho vùng {addr(r0, c0)}{r0 !== r1 || c0 !== c1 ? `:${addr(r1, c1)}` : ''}</p>
+            <label>Quy tắc
+              <select value={cfDlg.kind} onChange={(e) => setCfDlg({ ...cfDlg, kind: e.target.value as CfKind })}>
+                {CF_KINDS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+              </select>
+            </label>
+            {cfDlg.kind !== 'scale' && cfDlg.kind !== 'bar' && (
+              <div className="xl-cf-row">
+                <label>{cfDlg.kind === 'between' ? 'Từ' : cfDlg.kind === 'text' ? 'Chữ cần chứa' : 'Giá trị'}
+                  <input name="a" value={cfDlg.a} required onChange={(e) => setCfDlg({ ...cfDlg, a: e.target.value })} /></label>
+                {cfDlg.kind === 'between' && <label>Đến<input name="b" value={cfDlg.b} required onChange={(e) => setCfDlg({ ...cfDlg, b: e.target.value })} /></label>}
+              </div>
+            )}
+            {cfDlg.kind === 'scale' ? (
+              <div className="xl-cf-row">
+                <label>Nhỏ nhất<input type="color" value={cfDlg.c1} onChange={(e) => setCfDlg({ ...cfDlg, c1: e.target.value })} /></label>
+                {cfDlg.three && <label>Giữa<input type="color" value={cfDlg.c2} onChange={(e) => setCfDlg({ ...cfDlg, c2: e.target.value })} /></label>}
+                <label>Lớn nhất<input type="color" value={cfDlg.c3} onChange={(e) => setCfDlg({ ...cfDlg, c3: e.target.value })} /></label>
+                <label className="row"><input type="checkbox" checked={cfDlg.three} onChange={(e) => setCfDlg({ ...cfDlg, three: e.target.checked })} /> 3 màu</label>
+              </div>
+            ) : cfDlg.kind === 'bar' ? (
+              <div className="xl-cf-row">
+                <label>Màu thanh<input type="color" value={cfDlg.fill === '#FFC7CE' ? '#638EC6' : cfDlg.fill} onChange={(e) => setCfDlg({ ...cfDlg, fill: e.target.value })} /></label>
+              </div>
+            ) : (
+              <div className="xl-cf-row">
+                <label>Màu nền<input type="color" value={cfDlg.fill} onChange={(e) => setCfDlg({ ...cfDlg, fill: e.target.value })} /></label>
+                <label>Màu chữ<input type="color" value={cfDlg.color} onChange={(e) => setCfDlg({ ...cfDlg, color: e.target.value })} /></label>
+                <span className="xl-cf-sample" style={{ background: cfDlg.fill, color: cfDlg.color }}>Mẫu 123</span>
+              </div>
+            )}
+            {cfInSel.length > 0 && (
+              <div className="xl-cf-list">
+                <b>Quy tắc trong vùng chọn</b>
+                {cfInSel.map((x, i) => (
+                  <div key={i} className="xl-cf-item">
+                    <span className="xl-cf-sample" style={{ background: x.kind === 'scale' ? `linear-gradient(90deg, ${(x.colors ?? []).join(',')})` : x.kind === 'bar' ? x.colors?.[0] : x.fill, color: x.color }}>Aa</span>
+                    <span>{describeCf(x)}</span>
+                    <button type="button" className="icon-btn" title="Xoá quy tắc" onClick={() => updateSheet((s) => ({ ...s, cf: (s.cf ?? []).filter((y) => y !== x) }))}>✕</button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="modal-actions">
+              <span style={{ flex: 1 }} />
+              <button type="button" className="btn" onClick={() => setCfDlg(null)}>Đóng</button>
+              <button type="submit" className="btn primary">Áp dụng</button>
+            </div>
+          </form>
+        </div>
+      )}
     </EditorShell>
   );
 }

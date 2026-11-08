@@ -27,13 +27,13 @@ export const MIME: Record<DocKind, string> = {
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 };
 
-export const ACCEPT = '.pdf,.docx,.xlsx,' + Object.values(MIME).join(',');
+export const ACCEPT = '.pdf,.docx,.xlsx,.csv,.tsv,text/csv,' + Object.values(MIME).join(',');
 
 export function kindFromName(name: string): DocKind | null {
   const ext = name.toLowerCase().split('.').pop();
   if (ext === 'pdf') return 'pdf';
   if (ext === 'docx') return 'docx';
-  if (ext === 'xlsx') return 'xlsx';
+  if (ext === 'xlsx' || ext === 'csv' || ext === 'tsv') return 'xlsx';
   return null;
 }
 

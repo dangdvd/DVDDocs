@@ -1,6 +1,7 @@
 // Mô hình bảng tính thuần (không phụ thuộc giao diện): ô, định dạng, công thức, dịch tham chiếu.
 import FormulaParser from 'fast-formula-parser';
 import type { Chart } from './charts';
+import type { CfRule, Filter } from './cf';
 
 export interface CellStyle {
   bold?: boolean;
@@ -41,6 +42,12 @@ export interface Sheet {
   freeze?: { rows: number; cols: number };
   /** Biểu đồ nằm trên trang tính. */
   charts?: Chart[];
+  /** Định dạng có điều kiện. */
+  cf?: CfRule[];
+  /** Vùng lọc dữ liệu (AutoFilter). */
+  filter?: Filter;
+  /** Hàng bị ẩn (do người dùng hoặc tệp gốc), ngoài các hàng ẩn do lọc. */
+  hiddenRows?: Record<number, boolean>;
 }
 
 export interface Book { sheets: Sheet[] }

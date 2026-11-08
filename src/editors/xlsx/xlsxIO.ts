@@ -1,7 +1,9 @@
 // Đọc/ghi .xlsx bằng ExcelJS. Khi lưu, ghi đè lên workbook gốc để giữ nguyên những gì ta không sửa.
 import ExcelJS from 'exceljs';
+import JSZip from 'jszip';
 import { Book, Cell, CellStyle, Engine, Sheet, addr, dateToSerial, key, parseKey, parseRange, rangeRef } from './sheetModel';
 import { ChartData, Chart, chartData, readCharts, writeCharts } from './charts';
+import { autoFilterXml, columnValues, filterHidden, readAutoFilters, readCf, writeAutoFilters, writeCf } from './cf';
 import { uid } from '../../lib/uid';
 
 const argbToHex = (argb?: string) => (argb && argb.length >= 6 ? `#${argb.slice(-6)}` : undefined);
@@ -49,9 +51,36 @@ function readValue(v: ExcelJS.CellValue): Pick<Cell, 'v' | 'f'> {
 
 export interface LoadedBook { book: Book; wb: ExcelJS.Workbook; idMap: Map<string, number> }
 
+/**
+ * Một số chương trình (ví dụ openpyxl, LibreOffice) ghi drawing.xml không có tiền tố "xdr:" — ExcelJS không đọc được.
+ * Thêm tiền tố cho các thẻ không có tiền tố để ExcelJS đọc như tệp của Excel.
+ */
+export async function normalizeDrawings(data: ArrayBuffer): Promise<ArrayBuffer> {
+  const zip = await JSZip.loadAsync(data);
+  let changed = false;
+  for (const name of Object.keys(zip.files).filter((n) => /^xl\/drawings\/drawing\d+\.xml$/.test(n))) {
+    const xml = await zip.file(name)!.async('string');
+    if (!/<wsDr[\s>]/.test(xml)) continue;
+    const fixed = xml
+      .replace(/<(\/?)([A-Za-z][\w.-]*)(?=[\s/>])/g, (m, slash: string, tag: string) => `<${slash}xdr:${tag}`)
+      .replace(/(<xdr:wsDr\b[^>]*?)\sxmlns="([^"]*)"/, '$1 xmlns:xdr="$2"')
+      // Không gian tên mặc định khai báo lại bên trong (hiếm): đổi thành xdr.
+      .replace(/\sxmlns="http:\/\/schemas\.openxmlformats\.org\/drawingml\/2006\/spreadsheetDrawing"/g, '');
+    zip.file(name, fixed);
+    changed = true;
+  }
+  return changed ? zip.generateAsync({ type: 'arraybuffer' }) : data;
+}
+
 export async function loadXlsx(data: ArrayBuffer): Promise<LoadedBook> {
   const wb = new ExcelJS.Workbook();
-  await wb.xlsx.load(data);
+  try {
+    await wb.xlsx.load(data);
+  } catch (e) {
+    const fixed = await normalizeDrawings(data);
+    if (fixed === data) throw e;
+    await wb.xlsx.load(fixed);
+  }
   const idMap = new Map<string, number>();
   const sheets: Sheet[] = [];
   wb.eachSheet((ws) => {
@@ -59,6 +88,7 @@ export async function loadXlsx(data: ArrayBuffer): Promise<LoadedBook> {
     idMap.set(sheet.id, ws.id);
     ws.eachRow({ includeEmpty: true }, (row, rn) => {
       if (row.height) (sheet.rowHeights ??= {})[rn - 1] = Math.max(8, Math.round((row.height * 4) / 3));
+      if (row.hidden) (sheet.hiddenRows ??= {})[rn - 1] = true;
     });
     ws.eachRow({ includeEmpty: false }, (row, rn) => {
       row.eachCell({ includeEmpty: false }, (c, cn) => {
@@ -79,6 +109,12 @@ export async function loadXlsx(data: ArrayBuffer): Promise<LoadedBook> {
     if (view?.state === 'frozen' && ((view.xSplit ?? 0) > 0 || (view.ySplit ?? 0) > 0)) {
       sheet.freeze = { rows: view.ySplit ?? 0, cols: view.xSplit ?? 0 };
     }
+    try { const cf = readCf(ws); if (cf.length) sheet.cf = cf; } catch { /* bỏ qua */ }
+    const af = ws.autoFilter as unknown as string | { from: unknown; to: unknown } | undefined;
+    const end = (e: unknown) => (typeof e === 'string' ? e : e && typeof e === 'object' ? addr(Number((e as { row: number }).row) - 1, Number((e as { column: number }).column) - 1) : '');
+    const afRef = typeof af === 'string' ? af : af && typeof af === 'object' ? `${end(af.from)}:${end(af.to)}` : undefined;
+    const fr = afRef ? parseRange(afRef) : null;
+    if (fr) sheet.filter = { r: fr.r0, c0: fr.c0, c1: fr.c1, r1: fr.r1, hide: {} };
     sheet.rowCount = Math.max(100, ws.rowCount + 20);
     sheet.colCount = Math.max(26, ws.columnCount + 5);
     sheets.push(sheet);
@@ -87,6 +123,23 @@ export async function loadXlsx(data: ArrayBuffer): Promise<LoadedBook> {
     const charts = await readCharts(data, uid);
     for (const sh of sheets) { const c = charts.get(sh.name); if (c) sh.charts = c; }
   } catch { /* biểu đồ hỏng: vẫn mở được dữ liệu */ }
+  // Tiêu chí lọc: đổi danh sách giá trị còn hiện thành giá trị bị ẩn; hàng ẩn trong vùng lọc là do lọc.
+  if (sheets.some((s) => s.filter)) {
+    try {
+      const crit = await readAutoFilters(data);
+      const engine = new Engine({ sheets });
+      sheets.forEach((sh, si) => {
+        const f = sh.filter, fc = crit.get(sh.name);
+        if (!f) return;
+        if (fc) for (const [col, { vals, blank }] of Object.entries(fc.shown)) {
+          const c = f.c0 + Number(col), keep = new Set(vals);
+          const hide = columnValues(sh, engine, si, f, c).filter((v) => (v === '' ? !blank : !keep.has(v)));
+          if (hide.length) f.hide[c] = hide;
+        }
+        if (!fc?.unsupported && sh.hiddenRows) for (let r = f.r + 1; r <= f.r1; r++) delete sh.hiddenRows[r];
+      });
+    } catch { /* bỏ qua */ }
+  }
   if (!sheets.length) sheets.push({ id: uid(), name: 'Sheet1', cells: {}, colWidths: {}, rowCount: 100, colCount: 26 });
   return { book: { sheets }, wb, idMap };
 }
@@ -131,6 +184,7 @@ export async function saveXlsx(
   const wb = loaded?.wb ?? new ExcelJS.Workbook();
   wb.creator = wb.creator || 'DVDDocs';
   wb.modified = new Date();
+  const engine = new Engine(book);
   const keep = new Set<number>();
   const order: ExcelJS.Worksheet[] = [];
   book.sheets.forEach((sheet, si) => {
@@ -163,6 +217,13 @@ export async function saveXlsx(
     for (const m of sheet.merges ?? []) {
       try { ws.mergeCells(rangeRef(m)); } catch { /* vùng chồng lấn: bỏ qua */ }
     }
+    // Hàng ẩn: ẩn thủ công và ẩn do lọc.
+    const hidden = { ...(sheet.hiddenRows ?? {}), ...(sheet.filter ? filterHidden(sheet, engine, si, sheet.filter) : {}) };
+    ws.eachRow({ includeEmpty: true }, (row, rn) => { if (row.hidden && !hidden[rn - 1]) row.hidden = false; });
+    for (const r of Object.keys(hidden)) ws.getRow(Number(r) + 1).hidden = true;
+    const f = sheet.filter;
+    ws.autoFilter = f ? `${addr(f.r, f.c0)}:${addr(f.r1, f.c1)}` : (undefined as never);
+    writeCf(ws, sheet.cf);
     const fr = sheet.freeze;
     ws.views = fr && (fr.rows || fr.cols)
       ? [{ state: 'frozen', xSplit: fr.cols, ySplit: fr.rows, topLeftCell: addr(fr.rows, fr.cols) }]
@@ -173,10 +234,11 @@ export async function saveXlsx(
   const raw = await wb.xlsx.writeBuffer();
   const buf = raw instanceof ArrayBuffer ? raw : (new Uint8Array(raw as ArrayBufferLike).buffer as ArrayBuffer);
   // ExcelJS không ghi biểu đồ: thêm vào gói sau khi ghi.
-  const engine = new Engine(book);
   const charts = new Map<string, { chart: Chart; data: ChartData }[]>();
   book.sheets.forEach((s, si) => {
     if (s.charts?.length) charts.set(s.name, s.charts.map((chart) => ({ chart, data: chartData(chart, book, engine, si) })));
   });
-  return writeCharts(buf, charts);
+  const filters = new Map<string, string>();
+  book.sheets.forEach((s, si) => { if (s.filter) filters.set(s.name, autoFilterXml(s.filter, s, engine, si)); });
+  return writeAutoFilters(await writeCharts(buf, charts), filters);
 }

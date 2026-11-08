@@ -74,7 +74,7 @@ export default function App() {
 
       <section className="home-open">
         <button className="btn primary big" onClick={() => handle(pickFile())}>Mở tệp…</button>
-        <span className="muted">{platform() === 'desktop' || (platform() === 'web' && !matchMedia('(pointer: coarse)').matches) ? 'hoặc kéo thả tệp .pdf, .docx, .xlsx vào đây' : 'Hỗ trợ .pdf, .docx, .xlsx'}</span>
+        <span className="muted">{platform() === 'desktop' || (platform() === 'web' && !matchMedia('(pointer: coarse)').matches) ? 'hoặc kéo thả tệp .pdf, .docx, .xlsx, .csv vào đây' : 'Hỗ trợ .pdf, .docx, .xlsx, .csv'}</span>
       </section>
       {error && <div className="error-bar">{error}</div>}
 

@@ -5,6 +5,7 @@ import {
 } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import { Box, stripTextInBoxes } from './contentText';
+import { FontStyle, fontKey, loadFontBytes } from './fonts';
 
 /** Toạ độ "hiển thị" tính theo điểm (pt) ở tỉ lệ 1, gốc góc trên-trái của trang đã xoay. */
 export type Annot =
@@ -13,7 +14,7 @@ export type Annot =
   | { id: string; page: number; type: 'ink'; points: [number, number][]; color: string; width: number }
   | { id: string; page: number; type: 'image'; x: number; y: number; w: number; h: number; dataUrl: string }
   /** Sửa chữ có sẵn: che vùng chữ cũ (x, y, w, h) bằng màu nền `bg` rồi viết chữ mới cùng vị trí và cỡ. */
-  | { id: string; page: number; type: 'edit'; x: number; y: number; w: number; h: number; text: string; size: number; color: string; bg: string };
+  | { id: string; page: number; type: 'edit'; x: number; y: number; w: number; h: number; text: string; size: number; color: string; bg: string; font?: FontStyle };
 
 export function hexToRgb(hex: string) {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex);
@@ -44,18 +45,7 @@ export function toPdfPoint(page: PDFPage, dx: number, dy: number): [number, numb
   }
 }
 
-let fontBytesCache: ArrayBuffer | null = null;
-async function loadUnicodeFont(): Promise<ArrayBuffer | null> {
-  if (fontBytesCache) return fontBytesCache;
-  try {
-    const res = await fetch(new URL('fonts/DejaVuSans.ttf', document.baseURI).href);
-    if (!res.ok) return null;
-    fontBytesCache = await res.arrayBuffer();
-    return fontBytesCache;
-  } catch {
-    return null;
-  }
-}
+const loadUnicodeFont = () => loadFontBytes();
 
 function dataUrlBytes(dataUrl: string): { bytes: Uint8Array; png: boolean } {
   const [head, b64] = dataUrl.split(',');
@@ -111,6 +101,22 @@ export async function applyAnnotations(
     font = fb ? await doc.embedFont(fb, { subset: true }) : await doc.embedFont(StandardFonts.Helvetica);
     return font;
   };
+  // Phông gần giống phông gốc cho chữ sửa (có chân, đậm, nghiêng, đơn cách); thiếu tệp thì dùng phông mặc định.
+  const styled = new Map<string, PDFFont>();
+  const fontFor = async (s: FontStyle | undefined, text: string): Promise<PDFFont> => {
+    const base = await getFont();
+    if (!s || fontKey(s) === 'sans' || fontBytes !== undefined) return base;
+    const k = fontKey(s);
+    if (!styled.has(k)) {
+      const fb = await loadFontBytes(s);
+      styled.set(k, fb ? await doc.embedFont(fb, { subset: true }) : base);
+    }
+    const f = styled.get(k)!;
+    // Phông thiếu chữ (ví dụ phông đơn cách thiếu một số dấu tiếng Việt): dùng phông không chân cùng kiểu đậm/nghiêng.
+    const has = new Set(f.getCharacterSet());
+    if ([...text].every((ch) => ch === '\n' || has.has(ch.codePointAt(0)!))) return f;
+    return s.family === 'sans' ? base : fontFor({ ...s, family: 'sans' }, '');
+  };
   if (hasFields) await fillFields(doc, fields!, getFont);
   if (annots.some((a) => a.type === 'text' || a.type === 'edit')) await getFont();
   const pages = doc.getPages();
@@ -136,10 +142,11 @@ export async function applyAnnotations(
       page.drawRectangle({ x, y, width: a.w + 2, height: a.h + 1, color: hexToRgb(a.bg), rotate: rot });
     }
     if ((a.type === 'text' || a.type === 'edit') && font) {
+      const f = a.type === 'edit' ? await fontFor(a.font, a.text) : font;
       const lineH = a.size * 1.25;
       a.text.split('\n').forEach((line, i) => {
         const [x, y] = toPdfPoint(page, a.x, a.y + a.size * 0.95 + i * lineH);
-        page.drawText(line, { x, y, size: a.size, font: font!, color: hexToRgb(a.color), rotate: rot });
+        page.drawText(line, { x, y, size: a.size, font: f, color: hexToRgb(a.color), rotate: rot });
       });
     } else if (a.type === 'highlight' || a.type === 'rect' || a.type === 'whiteout') {
       const [x, y] = toPdfPoint(page, a.x, a.y + a.h);

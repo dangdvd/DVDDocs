@@ -135,3 +135,101 @@ export const SearchHighlight = Extension.create({
     })];
   },
 });
+
+declare module '@tiptap/core' {
+  interface Commands<ReturnType> {
+    lineHeight: { setLineHeight: (lh: string | null) => ReturnType };
+    tableOfContents: { insertTableOfContents: () => ReturnType };
+  }
+}
+
+/** Giãn dòng của đoạn (ví dụ "1.5"), lưu thành thuộc tính của đoạn văn/tiêu đề. */
+export const LineHeight = Extension.create({
+  name: 'lineHeight',
+  addGlobalAttributes() {
+    return [{
+      types: ['paragraph', 'heading'],
+      attributes: {
+        lineHeight: {
+          default: null,
+          parseHTML: (el) => {
+            const v = (el as HTMLElement).style.lineHeight;
+            return v && /^[\d.]+$/.test(v) ? v : null;
+          },
+          renderHTML: (a) => (a.lineHeight ? { style: `line-height: ${a.lineHeight}` } : {}),
+        },
+      },
+    }];
+  },
+  addCommands() {
+    return {
+      setLineHeight: (lh) => ({ tr, state, dispatch }) => {
+        const { from, to } = state.selection;
+        state.doc.nodesBetween(from, to, (node, pos) => {
+          if (node.type.name === 'paragraph' || node.type.name === 'heading') tr.setNodeMarkup(pos, undefined, { ...node.attrs, lineHeight: lh });
+        });
+        if (dispatch) dispatch(tr);
+        return true;
+      },
+    };
+  },
+});
+
+/** Màu nền ô bảng (thuộc tính backgroundColor của ô thường và ô tiêu đề). */
+export const cellBackground = {
+  backgroundColor: {
+    default: null,
+    parseHTML: (el: HTMLElement) => el.style.backgroundColor || el.getAttribute('data-bg') || null,
+    renderHTML: (a: Record<string, unknown>) => (a.backgroundColor ? { style: `background-color: ${a.backgroundColor}` } : {}),
+  },
+};
+
+/** Mục lục: hiển thị danh sách tiêu đề hiện có; khi lưu .docx thành trường TOC thật của Word (tự cập nhật số trang). */
+export const TableOfContents = Node.create({
+  name: 'tableOfContents',
+  group: 'block',
+  atom: true,
+  selectable: true,
+  parseHTML: () => [{ tag: 'div[data-toc]' }],
+  renderHTML: () => ['div', { 'data-toc': '', class: 'toc' }],
+  addCommands() {
+    return {
+      insertTableOfContents: () => ({ commands }) => commands.insertContent({ type: this.name }),
+    };
+  },
+  addNodeView() {
+    return ({ editor }) => {
+      const dom = document.createElement('div');
+      dom.className = 'toc';
+      dom.setAttribute('data-toc', '');
+      dom.contentEditable = 'false';
+      const render = () => {
+        const items: { level: number; text: string }[] = [];
+        editor.state.doc.descendants((n) => {
+          if (n.type.name === 'heading' && n.attrs.level <= 3 && n.textContent.trim()) items.push({ level: n.attrs.level, text: n.textContent });
+          return n.type.name !== 'heading';
+        });
+        dom.replaceChildren();
+        const title = document.createElement('div');
+        title.className = 'toc-title';
+        title.textContent = 'Mục lục';
+        dom.append(title);
+        if (!items.length) {
+          const e = document.createElement('div');
+          e.className = 'toc-empty';
+          e.textContent = 'Chưa có tiêu đề nào. Dùng "Tiêu đề 1–3" để mục lục tự liệt kê.';
+          dom.append(e);
+        }
+        for (const it of items) {
+          const d = document.createElement('div');
+          d.className = `toc-item l${it.level}`;
+          d.textContent = it.text;
+          dom.append(d);
+        }
+      };
+      render();
+      editor.on('update', render);
+      return { dom, destroy: () => editor.off('update', render) };
+    };
+  },
+});
