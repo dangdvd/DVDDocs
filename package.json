@@ -1,7 +1,7 @@
 {
   "name": "dvddocs",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DVDDocs: xem và sửa PDF, Word, Excel trên web, điện thoại và máy tính",
   "type": "module",
   "main": "electron/main.cjs",

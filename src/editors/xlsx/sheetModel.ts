@@ -1,5 +1,6 @@
 // Mô hình bảng tính thuần (không phụ thuộc giao diện): ô, định dạng, công thức, dịch tham chiếu.
 import FormulaParser from 'fast-formula-parser';
+import type { Chart } from './charts';
 
 export interface CellStyle {
   bold?: boolean;
@@ -38,6 +39,8 @@ export interface Sheet {
   merges?: Merge[];
   /** Số hàng phía trên và số cột bên trái được cố định khi cuộn. */
   freeze?: { rows: number; cols: number };
+  /** Biểu đồ nằm trên trang tính. */
+  charts?: Chart[];
 }
 
 export interface Book { sheets: Sheet[] }

@@ -4,8 +4,10 @@ import { EditorShell, Sep, ToolButton } from '../../components/EditorShell';
 import { uid } from '../../lib/uid';
 import {
   Book, Cell, CellStyle, Engine, Merge, Sheet, addr, colName, emptySheet, findMatches, formatValue, key, mergeAt,
-  moveFormula, parseInput, parseKey, rawText, replaceInCell, shiftFormula, shiftMerges, usedRange,
+  moveFormula, parseInput, parseKey, rawText, replaceInCell, shiftFormula, shiftMerges, shiftSpan, usedRange,
 } from './sheetModel';
+import { CHART_KINDS, Chart, ChartKind, chartData, chartFromRange } from './charts';
+import ChartView from './ChartView';
 import { LoadedBook, loadXlsx, saveXlsx } from './xlsxIO';
 
 const ROW_H = 24;
@@ -25,6 +27,12 @@ function indexAt(xs: number[], v: number) {
     if (xs[mid] <= v) lo = mid; else hi = mid - 1;
   }
   return lo;
+}
+
+/** Chỉ số có xs[i] gần v nhất (để bám biểu đồ vào lưới ô). */
+function nearestIdx(xs: number[], v: number) {
+  const i = indexAt(xs, v);
+  return i + 1 < xs.length && v - xs[i] > xs[i + 1] - v ? i + 1 : i;
 }
 
 const NUM_FORMATS: [string, string][] = [
@@ -49,6 +57,9 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
   const clip = useRef<{ text: string; r: number; c: number; cells: (Cell | undefined)[][] } | null>(null);
   const [find, setFind] = useState<{ q: string; repl: string; idx: number; replace: boolean } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [selChart, setSelChart] = useState<string | null>(null);
+  const chartDrag = useRef<{ id: string; mode: 'move' | 'size'; x: number; y: number; moved: boolean } | null>(null);
+  const [chartOff, setChartOff] = useState<{ id: string; dx: number; dy: number; mode: 'move' | 'size' } | null>(null);
 
   useEffect(() => {
     if (isNew) return;
@@ -241,6 +252,8 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
           }
           cells[key(r, c)] = cell;
         }
+        const refShift = (f?: string) => (f ? shiftFormula(f, s.name, target, axis, at, d) : f);
+        s = { ...s, charts: s.charts?.map((ch) => ({ ...ch, series: ch.series.map((x) => ({ name: refShift(x.name), cat: refShift(x.cat), val: refShift(x.val)! })) })) };
         if (i !== active) return { ...s, cells };
         let colWidths = s.colWidths;
         let rowHeights = s.rowHeights;
@@ -262,8 +275,16 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
             else if (n >= at - d) colWidths[n + d] = w;
           }
         }
+        const charts = s.charts?.flatMap((ch) => {
+          const a = ch.anchor;
+          // Neo biểu đồ: góc trên trái dịch theo hàng/cột; góc dưới phải là ranh giới (không bao gồm).
+          const span = axis === 'row' ? shiftSpan(a.r0, a.r1 - 1, at, d) : shiftSpan(a.c0, a.c1 - 1, at, d);
+          if (!span) return [];
+          const anchor = axis === 'row' ? { ...a, r0: span[0], r1: span[1] + 1 } : { ...a, c0: span[0], c1: span[1] + 1 };
+          return [{ ...ch, anchor }];
+        });
         return {
-          ...s, cells, colWidths, rowHeights, merges: shiftMerges(s.merges, axis, at, d),
+          ...s, cells, colWidths, rowHeights, merges: shiftMerges(s.merges, axis, at, d), charts,
           rowCount: s.rowCount + (axis === 'row' && d > 0 ? d : 0), colCount: s.colCount + (axis === 'col' && d > 0 ? d : 0),
         };
       }),
@@ -366,6 +387,50 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
     if (out.length) setCells(out);
     setNotice(out.length ? `Đã thay ${out.length} ô.` : 'Không có ô nào để thay (ô công thức chỉ thay khi chữ nằm trong công thức).');
   };
+
+  // ---- Biểu đồ ----
+  const updateChart = (id: string, fn: (c: Chart) => Chart | null) =>
+    updateSheet((s) => ({ ...s, charts: (s.charts ?? []).flatMap((c) => { if (c.id !== id) return [c]; const n = fn(c); return n ? [n] : []; }) }));
+  const insertChart = (kind: ChartKind) => {
+    if (!sheet || !engine) return;
+    let m = norm(sel);
+    if (m.r0 === m.r1 && m.c0 === m.c1) {
+      // Một ô: lấy vùng dữ liệu liền kề quanh ô như Excel.
+      const has = (r: number, c: number) => { const v = engine.valueAt(active, r, c); return v !== null && v !== ''; };
+      if (!has(m.r0, m.c0)) { setNotice('Hãy chọn vùng dữ liệu (kèm hàng tiêu đề) trước khi chèn biểu đồ.'); return; }
+      let { r0, r1, c0, c1 } = m;
+      for (let grew = true; grew;) {
+        grew = false;
+        const rowHas = (r: number) => { for (let c = Math.max(0, c0 - 1); c <= c1 + 1; c++) if (has(r, c)) return true; return false; };
+        const colHas = (c: number) => { for (let r = Math.max(0, r0 - 1); r <= r1 + 1; r++) if (has(r, c)) return true; return false; };
+        if (r0 > 0 && rowHas(r0 - 1)) { r0--; grew = true; }
+        if (rowHas(r1 + 1)) { r1++; grew = true; }
+        if (c0 > 0 && colHas(c0 - 1)) { c0--; grew = true; }
+        if (colHas(c1 + 1)) { c1++; grew = true; }
+      }
+      m = { r0, r1, c0, c1 };
+    }
+    const ch = chartFromRange(sheet, engine, active, m, kind, uid());
+    if (!ch) { setNotice('Vùng chọn không có số liệu để vẽ biểu đồ.'); return; }
+    // Màn hình rộng: đặt bên phải vùng dữ liệu (khoảng 480 × 288). Điện thoại: đặt ngay dưới, vừa bề ngang màn hình.
+    const gw = gridRef.current?.clientWidth ?? 800;
+    const narrow = gw < 600;
+    const c0 = narrow ? m.c0 : m.c1 + 1, r0 = narrow ? m.r1 + 2 : m.r0;
+    const c1 = Math.max(c0 + 1, nearestIdx(colX, colX[c0] + (narrow ? Math.max(200, gw - 24) : 480)));
+    const r1 = Math.max(r0 + 1, nearestIdx(rowY, rowY[r0] + (narrow ? 240 : 288)));
+    ch.anchor = { r0, c0, r1, c1 };
+    requestAnimationFrame(() => {
+      const el = gridRef.current;
+      if (!el) return;
+      const right = colX[c1] ?? 0, bottom = rowY[r1] ?? 0;
+      if (right > el.scrollLeft + el.clientWidth) el.scrollLeft = Math.min(colX[c0], right - el.clientWidth);
+      if (bottom > el.scrollTop + el.clientHeight) el.scrollTop = Math.min(rowY[r0], bottom - el.clientHeight);
+    });
+    updateSheet((s) => ({ ...s, charts: [...(s.charts ?? []), ch], rowCount: Math.max(s.rowCount, r1 + 20), colCount: Math.max(s.colCount, c1 + 5) }));
+    setSelChart(ch.id);
+    setNotice(null);
+  };
+  const activeChart = sheet?.charts?.find((c) => c.id === selChart);
 
   const save = async (saveAs = false) => {
     if (!book || !engine) return;
@@ -475,6 +540,8 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
     if (editing) return;
     const mod = e.ctrlKey || e.metaKey;
     const k = e.key;
+    if (selChart && (k === 'Delete' || k === 'Backspace')) { e.preventDefault(); updateChart(selChart, () => null); setSelChart(null); return; }
+    if (selChart && k === 'Escape') { setSelChart(null); return; }
     if (mod && k.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
     if (mod && k.toLowerCase() === 'y') { e.preventDefault(); redo(); return; }
     if (mod && k.toLowerCase() === 'b') { e.preventDefault(); toggle('bold'); return; }
@@ -640,6 +707,24 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
           <ToolButton icon="Z↓" label="Sắp xếp giảm" onClick={() => sort(false)} />
           <ToolButton icon="🔍" label="Tìm & thay" active={!!find} onClick={() => setFind(find ? null : { q: '', repl: '', idx: 0, replace: true })} />
           <ToolButton icon="❄" label={sheet.freeze ? 'Bỏ cố định' : 'Cố định'} active={!!sheet.freeze} onClick={toggleFreeze} />
+          <ToolButton icon="📊" label="Chèn biểu đồ" onClick={() => insertChart('col')} />
+          {activeChart && (
+            <>
+              <label className="tb-field" title="Loại biểu đồ">
+                <select value={activeChart.kind} onChange={(e) => {
+                  const kind = e.target.value as ChartKind;
+                  updateChart(activeChart.id, (c) => ({ ...c, kind }));
+                }}>
+                  {CHART_KINDS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+                </select>
+              </label>
+              <ToolButton icon="T" label="Tiêu đề biểu đồ" onClick={() => {
+                const t = prompt('Tiêu đề biểu đồ (để trống để bỏ)', activeChart.title ?? '');
+                if (t !== null) updateChart(activeChart.id, (c) => ({ ...c, title: t.trim() || undefined }));
+              }} />
+              <ToolButton icon="🗑" label="Xoá biểu đồ" onClick={() => { updateChart(activeChart.id, () => null); setSelChart(null); }} />
+            </>
+          )}
           <Sep />
           <ToolButton icon="+≡" label="Chèn hàng" onClick={() => shift('row', 1)} />
           <ToolButton icon="−≡" label="Xoá hàng" onClick={() => shift('row', -1)} />
@@ -736,7 +821,8 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
             onCut={(e) => { if (editing) return; e.preventDefault(); e.clipboardData.setData('text/plain', rangeTSV()); clearRange(); }}
             onPaste={(e) => { if (editing) return; e.preventDefault(); paste(e.clipboardData.getData('text/plain')); }}
             onPointerDown={(e) => {
-              if ((e.target as HTMLElement).closest('.xl-editor')) return;
+              if ((e.target as HTMLElement).closest('.xl-editor, .xl-chart')) return;
+              if (selChart) setSelChart(null);
               const { r, c } = cellFromEvent(e);
               if (editing) commitEdit();
               if (e.shiftKey) setSel({ ...sel, r2: r, c2: c });
@@ -780,6 +866,56 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
                   {renderSel(0, FR - 1, 0, FC - 1)}
                 </div>
               )}
+              {sheet.charts?.map((ch) => {
+                const a = ch.anchor;
+                if (a.c1 >= colX.length || a.r1 >= rowY.length) return null;
+                const off = chartOff?.id === ch.id ? chartOff : null;
+                const left = colX[a.c0] + (off?.mode === 'move' ? off.dx : 0), top = rowY[a.r0] + (off?.mode === 'move' ? off.dy : 0);
+                const w = Math.max(80, colX[a.c1] - colX[a.c0] + (off?.mode === 'size' ? off.dx : 0));
+                const h = Math.max(60, rowY[a.r1] - rowY[a.r0] + (off?.mode === 'size' ? off.dy : 0));
+                const on = selChart === ch.id;
+                const start = (e: React.PointerEvent, mode: 'move' | 'size') => {
+                  e.stopPropagation();
+                  if (editing) commitEdit();
+                  setSelChart(ch.id);
+                  gridRef.current?.focus({ preventScroll: true });
+                  if (mode === 'move' && !on && e.pointerType !== 'mouse') return; // chạm lần đầu chỉ chọn, để vẫn cuộn được
+                  (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+                  chartDrag.current = { id: ch.id, mode, x: e.clientX, y: e.clientY, moved: false };
+                };
+                const move = (e: React.PointerEvent) => {
+                  const d = chartDrag.current;
+                  if (!d || d.id !== ch.id) return;
+                  e.stopPropagation();
+                  const dx = e.clientX - d.x, dy = e.clientY - d.y;
+                  if (Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
+                  setChartOff({ id: ch.id, dx, dy, mode: d.mode });
+                };
+                const end = (e: React.PointerEvent) => {
+                  const d = chartDrag.current;
+                  chartDrag.current = null;
+                  setChartOff(null);
+                  if (!d || !d.moved) return;
+                  e.stopPropagation();
+                  const dx = e.clientX - d.x, dy = e.clientY - d.y;
+                  updateChart(ch.id, (c) => {
+                    const an = c.anchor;
+                    if (d.mode === 'size') {
+                      return { ...c, anchor: { ...an, c1: Math.max(an.c0 + 1, nearestIdx(colX, colX[an.c1] + dx)), r1: Math.max(an.r0 + 1, nearestIdx(rowY, rowY[an.r1] + dy)) } };
+                    }
+                    const c0 = nearestIdx(colX, Math.max(0, colX[an.c0] + dx)), r0 = nearestIdx(rowY, Math.max(0, rowY[an.r0] + dy));
+                    return { ...c, anchor: { r0, c0, r1: r0 + an.r1 - an.r0, c1: c0 + an.c1 - an.c0 } };
+                  });
+                };
+                return (
+                  <div key={ch.id} className={`xl-chart${on ? ' on' : ''}`} style={{ left, top, width: w, height: h, touchAction: on ? 'none' : undefined }}
+                    onPointerDown={(e) => start(e, 'move')} onPointerMove={move} onPointerUp={end} onPointerCancel={end}
+                    onDoubleClick={(e) => e.stopPropagation()}>
+                    <ChartView kind={ch.kind} title={ch.title} data={chartData(ch, book, engine, active)} w={w} h={h} />
+                    {on && <span className="xl-chart-size" onPointerDown={(e) => start(e, 'size')} onPointerMove={move} onPointerUp={end} onPointerCancel={end} />}
+                  </div>
+                );
+              })}
               {editing && !editing.inBar && (
                 <textarea
                   className="xl-editor"

@@ -4,13 +4,16 @@ import {
   StandardFonts, degrees, rgb,
 } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
+import { Box, stripTextInBoxes } from './contentText';
 
 /** Toạ độ "hiển thị" tính theo điểm (pt) ở tỉ lệ 1, gốc góc trên-trái của trang đã xoay. */
 export type Annot =
   | { id: string; page: number; type: 'text'; x: number; y: number; text: string; size: number; color: string }
   | { id: string; page: number; type: 'highlight' | 'rect' | 'whiteout'; x: number; y: number; w: number; h: number; color: string }
   | { id: string; page: number; type: 'ink'; points: [number, number][]; color: string; width: number }
-  | { id: string; page: number; type: 'image'; x: number; y: number; w: number; h: number; dataUrl: string };
+  | { id: string; page: number; type: 'image'; x: number; y: number; w: number; h: number; dataUrl: string }
+  /** Sửa chữ có sẵn: che vùng chữ cũ (x, y, w, h) bằng màu nền `bg` rồi viết chữ mới cùng vị trí và cỡ. */
+  | { id: string; page: number; type: 'edit'; x: number; y: number; w: number; h: number; text: string; size: number; color: string; bg: string };
 
 export function hexToRgb(hex: string) {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex);
@@ -109,13 +112,30 @@ export async function applyAnnotations(
     return font;
   };
   if (hasFields) await fillFields(doc, fields!, getFont);
-  if (annots.some((a) => a.type === 'text')) await getFont();
+  if (annots.some((a) => a.type === 'text' || a.type === 'edit')) await getFont();
   const pages = doc.getPages();
+  // Sửa chữ có sẵn: xoá hẳn chữ cũ khỏi nội dung trang (nếu đọc được), sau đó vẫn che nền để chắc chắn.
+  const boxes = new Map<number, Box[]>();
+  for (const a of annots) {
+    if (a.type !== 'edit' || !pages[a.page]) continue;
+    const p0 = toPdfPoint(pages[a.page], a.x, a.y), p1 = toPdfPoint(pages[a.page], a.x + a.w, a.y + a.h);
+    const list = boxes.get(a.page) ?? [];
+    list.push({ x0: Math.min(p0[0], p1[0]), y0: Math.min(p0[1], p1[1]), x1: Math.max(p0[0], p1[0]), y1: Math.max(p0[1], p1[1]) });
+    boxes.set(a.page, list);
+  }
+  for (const [pi, list] of boxes) {
+    try { stripTextInBoxes(doc, pages[pi], list); } catch { /* luồng nội dung lạ: chỉ che */ }
+  }
   for (const a of annots) {
     const page = pages[a.page];
     if (!page) continue;
     const rot = degrees(normRotation(page.getRotation().angle));
-    if (a.type === 'text' && font) {
+    if (a.type === 'edit' && font) {
+      // Che chữ gốc (rộng hơn một chút để không lộ viền khử răng cưa) rồi viết chữ mới.
+      const [x, y] = toPdfPoint(page, a.x - 1, a.y + a.h + 0.5);
+      page.drawRectangle({ x, y, width: a.w + 2, height: a.h + 1, color: hexToRgb(a.bg), rotate: rot });
+    }
+    if ((a.type === 'text' || a.type === 'edit') && font) {
       const lineH = a.size * 1.25;
       a.text.split('\n').forEach((line, i) => {
         const [x, y] = toPdfPoint(page, a.x, a.y + a.size * 0.95 + i * lineH);

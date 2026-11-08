@@ -232,3 +232,21 @@ textarea.form-field { padding-top: 1px; line-height: 1.2; }
 .search-hit { background: rgba(255, 196, 0, .45); border-radius: 2px; }
 .search-hit.cur { background: rgba(255, 120, 0, .6); outline: 1px solid #f57c00; }
 @media print { .docx-page .ProseMirror .page-break { border: 0; margin: 0; } .docx-page .ProseMirror .page-break::after { display: none; } .search-hit { background: none; outline: 0; } .xl-find { display: none !important; } }
+
+/* Biểu đồ Excel */
+.xl-chart { position: absolute; z-index: 1; background: #fff; border: 1px solid #d0d4da; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12); cursor: move; user-select: none; -webkit-user-select: none; }
+.xl-chart.on { outline: 2px solid #1a73e8; outline-offset: 1px; }
+.xl-chart svg { pointer-events: none; }
+.xl-chart-size { position: absolute; right: -7px; bottom: -7px; width: 14px; height: 14px; background: #fff; border: 2px solid #1a73e8; border-radius: 50%; cursor: nwse-resize; touch-action: none; }
+@media (pointer: coarse) { .xl-chart-size { width: 22px; height: 22px; right: -11px; bottom: -11px; } }
+
+/* Theo dõi thay đổi (Word) */
+.ProseMirror ins.tc-ins { color: #0b6e3a; text-decoration: underline; text-decoration-color: #0b6e3a; background: #e6f6ec; }
+.ProseMirror del.tc-del { color: #c62828; text-decoration: line-through; text-decoration-color: #c62828; background: #fdecea; }
+@media print { .ProseMirror ins.tc-ins, .ProseMirror del.tc-del { background: none; } }
+
+/* Sửa chữ có sẵn trong PDF */
+.annot-layer.tool-edittext { cursor: text; touch-action: pan-x pan-y; }
+.pdf-tline { position: absolute; border-radius: 2px; outline: 1px dashed rgba(31, 111, 235, .45); background: rgba(31, 111, 235, .05); pointer-events: none; }
+.annot-edit { line-height: 1.2; box-shadow: 0 0 0 1px rgba(31, 111, 235, .35); }
+.annot-edit textarea { line-height: 1.2; margin-top: -0.06em; min-width: 0; white-space: pre; }
