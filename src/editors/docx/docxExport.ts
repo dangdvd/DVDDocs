@@ -1,11 +1,11 @@
 // Chuyển nội dung trình soạn thảo (JSON của TipTap/ProseMirror) sang tệp .docx thật bằng thư viện `docx`.
 import {
-  AlignmentType, BorderStyle, Document, ExternalHyperlink, Footer, HeadingLevel, ImageRun, LevelFormat, Packer,
+  AlignmentType, BorderStyle, DeletedTextRun, Document, ExternalHyperlink, InsertedTextRun, Footer, HeadingLevel, ImageRun, LevelFormat, Packer,
   PageBreak, PageNumber, PageOrientation, Paragraph, ParagraphChild, ShadingType, Table, TableCell, TableRow, TextRun, WidthType,
 } from 'docx';
 
 /** Thiết lập trang khi xuất: khổ ngang và đánh số trang ở chân trang. */
-export interface PageSetup { landscape: boolean; pageNumbers: boolean }
+export interface PageSetup { landscape: boolean; pageNumbers: boolean; /** Bật theo dõi thay đổi khi mở trong Word. */ track?: boolean }
 
 /** "12pt" | "16px" | "1.5em" → nửa điểm (đơn vị cỡ chữ của Word), hoặc undefined. */
 export function halfPoints(size?: string | null): number | undefined {
@@ -78,6 +78,7 @@ const MAX_IMG_W = 600;
 
 class Converter {
   listInstance = 0;
+  revision = 1;
 
   runs(nodes: PMNode[] = []): ParagraphChild[] {
     const out: ParagraphChild[] = [];
@@ -94,7 +95,7 @@ class Converter {
         const family = (ts?.fontFamily as string | undefined)?.replace(/["']/g, '').split(',')[0].trim();
         const hl = has('highlight');
         const link = has('link');
-        const run = new TextRun({
+        const opts = {
           text: n.text,
           bold: !!has('bold'),
           italics: !!has('italic'),
@@ -106,7 +107,15 @@ class Converter {
           superScript: !!has('superscript'),
           subScript: !!has('subscript'),
           shading: hl ? { type: ShadingType.CLEAR, color: 'auto', fill: toHex(hl.attrs?.color) ?? 'FFFF00' } : undefined,
-        });
+        };
+        // Thay đổi được theo dõi → <w:ins>/<w:del> để Word hiện đúng và cho chấp nhận/từ chối.
+        const change = has('insertion') ?? has('deletion');
+        if (change) {
+          const rev = { id: this.revision++, author: String(change.attrs?.author || 'DVDDocs'), date: String(change.attrs?.date || new Date().toISOString()) };
+          out.push(change.type === 'insertion' ? new InsertedTextRun({ ...opts, ...rev }) : new DeletedTextRun({ ...opts, ...rev }));
+          continue;
+        }
+        const run = new TextRun(opts);
         out.push(link?.attrs?.href ? new ExternalHyperlink({ link: link.attrs.href, children: [run] }) : run);
       }
     }
@@ -208,6 +217,7 @@ export function buildDocument(json: PMNode, setup: PageSetup = { landscape: fals
   const fmts = [LevelFormat.DECIMAL, LevelFormat.LOWER_LETTER, LevelFormat.LOWER_ROMAN];
   return new Document({
     creator: 'DVDDocs',
+    features: setup.track ? { trackRevisions: true } : undefined,
     styles: { default: { document: { run: { font: 'Arial', size: 22 } } } },
     numbering: {
       config: [{

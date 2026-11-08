@@ -18,7 +18,72 @@ if (typeof FontFace !== 'undefined') {
   face.load().then((f) => document.fonts.add(f)).catch(() => {});
 }
 
-type Tool = 'select' | 'text' | 'highlight' | 'rect' | 'whiteout' | 'ink' | 'place';
+type Tool = 'select' | 'edittext' | 'text' | 'highlight' | 'rect' | 'whiteout' | 'ink' | 'place';
+/** Một dòng chữ có sẵn trong trang (pt, gốc trên-trái), ghép từ các đoạn chữ cùng đường chân chữ. */
+type TextLine = { x: number; y: number; w: number; h: number; size: number; text: string };
+
+/** Đọc các dòng chữ của một trang để sửa trực tiếp. */
+async function readLines(doc: PDFDocumentProxy, index: number): Promise<TextLine[]> {
+  const page = await doc.getPage(index + 1);
+  const vp = page.getViewport({ scale: 1 });
+  const tc = await page.getTextContent();
+  const items: { x: number; base: number; w: number; size: number; str: string }[] = [];
+  for (const it of tc.items) {
+    if (!('str' in it) || !it.str) continue;
+    const t = pdfjs.Util.transform(vp.transform, it.transform);
+    // Chỉ chữ nằm ngang (theo hướng hiển thị).
+    if (Math.abs(t[1]) > 0.01 * Math.abs(t[0]) || t[0] <= 0) continue;
+    const size = Math.hypot(t[2], t[3]) || 10;
+    items.push({ x: t[4], base: t[5], w: it.width * (vp.scale || 1), size, str: it.str });
+  }
+  items.sort((a, b) => a.base - b.base || a.x - b.x);
+  const lines: (TextLine & { base: number })[] = [];
+  for (const it of items) {
+    const last = lines[lines.length - 1];
+    const gap = last ? it.x - (last.x + last.w) : 0;
+    if (last && Math.abs(last.base - it.base) < it.size * 0.25 && gap > -it.size * 0.5 && gap < it.size * 1.2) {
+      const space = gap > it.size * 0.15 && !/\s$/.test(last.text) && !/^\s/.test(it.str) ? ' ' : '';
+      last.text += space + it.str;
+      last.w = Math.max(last.w, it.x + it.w - last.x);
+      last.size = Math.max(last.size, it.size);
+    } else {
+      lines.push({ x: it.x, base: it.base, w: it.w, size: it.size, text: it.str, y: 0, h: 0 });
+    }
+  }
+  return lines
+    .filter((l) => l.text.trim())
+    .map(({ base, ...l }) => ({ ...l, text: l.text.replace(/\s+$/, ''), y: base - l.size * 0.95, h: l.size * 1.2 }));
+}
+
+/** Lấy màu nền (viền vùng) và màu chữ (điểm khác nền nhất) của một vùng trên canvas đã vẽ trang. */
+function sampleColors(canvas: HTMLCanvasElement | null, pageW: number, r: { x: number; y: number; w: number; h: number }) {
+  const fallback = { bg: '#ffffff', fg: '#000000' };
+  const ctx = canvas?.getContext('2d', { willReadFrequently: true });
+  if (!canvas || !ctx || !canvas.width) return fallback;
+  const k = canvas.width / pageW;
+  const x0 = Math.max(0, Math.floor(r.x * k)), y0 = Math.max(0, Math.floor(r.y * k));
+  const w = Math.min(canvas.width - x0, Math.ceil(r.w * k)), h = Math.min(canvas.height - y0, Math.ceil(r.h * k));
+  if (w < 2 || h < 2) return fallback;
+  let data: Uint8ClampedArray;
+  try { data = ctx.getImageData(x0, y0, w, h).data; } catch { return fallback; }
+  const px = (i: number, j: number) => { const o = (j * w + i) * 4; return [data[o], data[o + 1], data[o + 2]]; };
+  // Nền: màu xuất hiện nhiều nhất trên viền vùng.
+  const counts = new Map<string, number>();
+  const edge: number[][] = [];
+  for (let i = 0; i < w; i++) edge.push(px(i, 0), px(i, h - 1));
+  for (let j = 0; j < h; j++) edge.push(px(0, j), px(w - 1, j));
+  for (const c of edge) { const key = c.map((v) => v >> 3).join(','); counts.set(key, (counts.get(key) ?? 0) + 1); }
+  const top = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  const bgc = edge.find((c) => c.map((v) => v >> 3).join(',') === top)!;
+  let best = bgc, dist = 0;
+  for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+    const c = px(i, j);
+    const d = Math.abs(c[0] - bgc[0]) + Math.abs(c[1] - bgc[1]) + Math.abs(c[2] - bgc[2]);
+    if (d > dist) { dist = d; best = c; }
+  }
+  const hex = (c: number[]) => `#${c.map((v) => v.toString(16).padStart(2, '0')).join('')}`;
+  return { bg: hex(bgc), fg: dist > 60 ? hex(best) : '#000000' };
+}
 type Size = { w: number; h: number };
 /** Vị trí một kết quả tìm kiếm (pt, gốc trên-trái của trang). w = 0 khi chỉ biết trang. */
 type Hit = { page: number; x: number; y: number; w: number; h: number };
@@ -74,6 +139,7 @@ interface Snapshot { bytes: Uint8Array; annots: Annot[] }
 
 const TOOLS: { id: Tool; label: string; icon: string; hint: string }[] = [
   { id: 'select', label: 'Chọn', icon: '↖', hint: 'Chọn, kéo để di chuyển, Delete để xoá' },
+  { id: 'edittext', label: 'Sửa chữ', icon: 'Ꞩ', hint: 'Bấm vào một dòng chữ có sẵn để sửa trực tiếp' },
   { id: 'text', label: 'Chữ', icon: 'T', hint: 'Bấm vào trang để thêm chữ' },
   { id: 'highlight', label: 'Tô sáng', icon: '▮', hint: 'Kéo để tô sáng' },
   { id: 'rect', label: 'Khung', icon: '▭', hint: 'Kéo để vẽ khung' },
@@ -107,6 +173,7 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
   const [formInit, setFormInit] = useState<FieldValues>({});
   const [formEdits, setFormEdits] = useState<FieldValues>({});
   const [curPage, setCurPage] = useState(0);
+  const [lines, setLines] = useState<Record<number, TextLine[]>>({});
   const scrollRef = useRef<HTMLDivElement>(null);
   const pagesRef = useRef<HTMLDivElement>(null);
   const fitted = useRef(false);
@@ -278,6 +345,28 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
       if (p) setPath(p);
       setDirty(false);
     });
+
+  // Dòng chữ có sẵn: đọc khi bật công cụ "Sửa chữ"; đọc lại khi tài liệu đổi (xoay, xoá trang…).
+  useEffect(() => setLines({}), [doc]);
+  useEffect(() => {
+    if (tool !== 'edittext' || !doc) return;
+    let stop = false;
+    (async () => {
+      for (let i = 0; i < doc.numPages && !stop; i++) {
+        if (lines[i]) continue;
+        const ls = await readLines(doc, i).catch(() => [] as TextLine[]);
+        if (!stop) setLines((m) => ({ ...m, [i]: ls }));
+      }
+    })();
+    return () => { stop = true; };
+  }, [tool, doc]);
+  const pickLine = (page: number, l: TextLine) => {
+    const canvas = pagesRef.current?.querySelector<HTMLCanvasElement>(`.pdf-page[data-page="${page}"] canvas`) ?? null;
+    const { bg, fg } = sampleColors(canvas, sizes[page].w, l);
+    const a: Annot = { id: uid(), page, type: 'edit', x: l.x, y: l.y, w: l.w, h: l.h, text: l.text, size: +l.size.toFixed(2), color: fg, bg };
+    addAnnot(a);
+    setSelected(a.id);
+  };
 
   const updateAnnot = (id: string, patch: Partial<Annot>, record = false) => {
     if (record) snapshot();
@@ -552,6 +641,8 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
                 onAdd={(a) => { addAnnot(a); setSelected(a.id); if (a.type === 'image') { setPending(null); setTool('select'); } if (a.type === 'text') setTool('select'); }}
                 onUpdate={updateAnnot}
                 onBeginChange={snapshot}
+                lines={tool === 'edittext' ? lines[i] : undefined}
+                onPickLine={(l) => pickLine(i, l)}
               />
               {fields.some((f) => f.page === i) && (
                 <FormLayer fields={fields.filter((f) => f.page === i)} zoom={zoom} active={tool === 'select'}
@@ -769,6 +860,7 @@ interface LayerProps {
   annots: Annot[]; selected: string | null; pending: { dataUrl: string; w: number; h: number } | null;
   onSelect(id: string | null): void; onAdd(a: Annot): void;
   onUpdate(id: string, patch: Partial<Annot>, record?: boolean): void; onBeginChange(): void;
+  lines?: TextLine[]; onPickLine(l: TextLine): void;
 }
 
 function AnnotLayer(p: LayerProps) {
@@ -786,12 +878,20 @@ function AnnotLayer(p: LayerProps) {
     if (e.button !== 0) return;
     const [x, y] = pt(e);
     const target = (e.target as HTMLElement).closest('[data-annot]') as HTMLElement | null;
+    if (p.tool === 'edittext') {
+      if (target) { p.onSelect(target.dataset.annot!); return; }
+      const pad = 2;
+      const l = p.lines?.find((t) => x >= t.x - pad && x <= t.x + t.w + pad && y >= t.y - pad && y <= t.y + t.h + pad);
+      if (l) { e.preventDefault(); p.onPickLine(l); } else p.onSelect(null);
+      return;
+    }
     if (p.tool === 'select') {
       if (!target) return p.onSelect(null);
       const id = target.dataset.annot!;
       const orig = p.annots.find((a) => a.id === id)!;
       p.onSelect(id);
-      if ((e.target as HTMLElement).tagName === 'TEXTAREA') return;
+      // Chữ sửa trực tiếp phải nằm đúng chỗ chữ cũ: không cho kéo đi.
+      if ((e.target as HTMLElement).tagName === 'TEXTAREA' || orig.type === 'edit') return;
       drag.current = { id, sx: x, sy: y, orig, mode: (e.target as HTMLElement).dataset.handle ? 'resize' : 'move', moved: false };
       ref.current!.setPointerCapture(e.pointerId);
       return;
@@ -891,7 +991,29 @@ function AnnotLayer(p: LayerProps) {
           return null;
         })}
       </svg>
+      {p.lines?.filter((l) => !mine.some((a) => a.type === 'edit' && Math.abs(a.x - l.x) < 1 && Math.abs(a.y - l.y) < 1)).map((l, k) => (
+        <div key={`l${k}`} className="pdf-tline" style={{ left: l.x * z, top: l.y * z, width: l.w * z, height: l.h * z }} />
+      ))}
       {mine.map((a) => {
+        if (a.type === 'edit') {
+          return (
+            <div
+              key={a.id}
+              data-annot={a.id}
+              className={`annot-text annot-edit ${a.id === p.selected ? 'sel' : ''}`}
+              style={{ left: a.x * z, top: a.y * z, fontSize: a.size * z, color: a.color, minWidth: a.w * z, minHeight: a.h * z, background: a.bg }}
+            >
+              <textarea
+                autoFocus
+                value={a.text}
+                rows={Math.max(1, a.text.split('\n').length)}
+                style={{ width: `max(${a.w * z}px, ${Math.max(1, ...a.text.split('\n').map((l) => l.length)) * 0.62 + 0.6}em)` }}
+                onFocus={() => p.onSelect(a.id)}
+                onChange={(e) => p.onUpdate(a.id, { text: e.target.value })}
+              />
+            </div>
+          );
+        }
         if (a.type === 'text') {
           return (
             <div

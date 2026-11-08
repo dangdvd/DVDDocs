@@ -20,6 +20,7 @@ import { OpenedFile, saveFile } from '../../lib/fileio';
 import { EditorShell, Sep, ToolButton } from '../../components/EditorShell';
 import { exportDocx, PageSetup, PMNode } from './docxExport';
 import { FontSize, PageBreak, SearchHighlight, findInDoc, searchKey } from './extensions';
+import { TrackChanges, currentAuthor, listChanges, markTrackedRuns, trackKey, trackedMarkersToHtml } from './trackChanges';
 
 const FONTS = ['Arial', 'Calibri', 'Cambria', 'Times New Roman', 'Tahoma', 'Verdana', 'Georgia', 'Courier New'];
 const SIZES = [8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72];
@@ -29,6 +30,15 @@ interface MammothTransforms { run(fn: (r: MammothRun) => MammothRun): unknown }
 
 async function docxToHtml(data: ArrayBuffer): Promise<{ html: string; warnings: string[] }> {
   const mammoth = await import('mammoth');
+  // Giữ các thay đổi được theo dõi (chèn/xoá) của tệp gốc.
+  try {
+    const zip = await JSZip.loadAsync(data);
+    const xml = await zip.file('word/document.xml')?.async('string');
+    if (xml && /<w:(ins|del)\b/.test(xml)) {
+      zip.file('word/document.xml', markTrackedRuns(xml));
+      data = await zip.generateAsync({ type: 'arraybuffer' });
+    }
+  } catch { /* tệp lạ: để mammoth tự xử lý */ }
   const transforms = ((mammoth as unknown as { default?: { transforms?: MammothTransforms } }).default?.transforms
     ?? (mammoth as unknown as { transforms: MammothTransforms }).transforms);
   const res = await mammoth.convertToHtml(
@@ -49,10 +59,11 @@ async function docxToHtml(data: ArrayBuffer): Promise<{ html: string; warnings: 
     } as Parameters<typeof mammoth.convertToHtml>[1],
   );
   // mammoth đặt ngắt trang trong một đoạn riêng: đưa ra ngoài để thành khối ngắt trang.
-  const html = res.value
+  let html = res.value
     .replace(/<p>\s*<hr class="page-break" \/>\s*<\/p>/g, '<hr class="page-break" />')
     .replace(/\uE000([^\uE001<>"]*)\uE001/g, '<span style="$1">')
     .replace(/\uE002/g, '</span>');
+  html = trackedMarkersToHtml(html);
   return { html, warnings: res.messages.filter((m) => m.type === 'warning').map((m) => m.message) };
 }
 
@@ -68,7 +79,9 @@ async function readPageSetup(data: ArrayBuffer): Promise<PageSetup> {
     for (const name of Object.keys(zip.files).filter((n) => /^word\/footer\d*\.xml$/.test(n))) {
       if (/\bPAGE\b/.test(await zip.file(name)!.async('string'))) pageNumbers = true;
     }
-    return { landscape, pageNumbers };
+    const settings = (await zip.file('word/settings.xml')?.async('string')) ?? '';
+    const track = /<w:trackRevisions\b(?![^>]*w:val="(false|0|off)")/.test(settings);
+    return { landscape, pageNumbers, track };
   } catch {
     return { landscape: false, pageNumbers: false };
   }
@@ -102,6 +115,7 @@ export default function DocxEditor({ file, onClose }: { file: OpenedFile; onClos
       Link.configure({ openOnClick: false, autolink: true, HTMLAttributes: { rel: 'noopener noreferrer', target: null } }),
       PageBreak,
       SearchHighlight,
+      TrackChanges,
       Highlight.configure({ multicolor: true }),
       TextAlign.configure({ types: ['heading', 'paragraph'] }),
       Table.configure({ resizable: true }),
@@ -118,10 +132,12 @@ export default function DocxEditor({ file, onClose }: { file: OpenedFile; onClos
 
   useEffect(() => {
     if (!editor || isNew) return;
-    readPageSetup(file.data).then(setSetup);
+    const setupP = readPageSetup(file.data);
+    setupP.then(setSetup);
     docxToHtml(file.data)
-      .then(({ html, warnings }) => {
+      .then(async ({ html, warnings }) => {
         editor.commands.setContent(html || '<p></p>', false);
+        if ((await setupP).track) editor.commands.setTrackChanges(true);
         if (warnings.length) setNotice('Một số định dạng phức tạp (màu chữ, căn lề, header/footer…) chỉ hiển thị đầy đủ ở chế độ "Bố cục gốc".');
       })
       .catch((e) => setError(`Không mở được tệp Word: ${e.message ?? e}`))
@@ -141,7 +157,7 @@ export default function DocxEditor({ file, onClose }: { file: OpenedFile; onClos
     if (!editor) return;
     setBusy('Đang lưu…');
     try {
-      const out = await exportDocx(editor.getJSON() as PMNode, setup);
+      const out = await exportDocx(editor.getJSON() as PMNode, { ...setup, track: !!trackKey.getState(editor.state)?.on });
       const finalName = name.toLowerCase().endsWith('.docx') ? name : `${name}.docx`;
       const p = await saveFile({ name: finalName, kind: 'docx', path }, out, saveAs || (isNew && !path));
       if (p) { setPath(p); setName(p.split(/[\\/]/).pop() ?? finalName); }
@@ -206,6 +222,8 @@ export default function DocxEditor({ file, onClose }: { file: OpenedFile; onClos
     editor?.commands.focus();
   };
 
+  const changes = useMemo(() => (doc ? listChanges(doc).length : 0), [doc]);
+  const tracking = !!(editor && trackKey.getState(editor.state)?.on);
   const text = editor?.state.doc.textContent ?? '';
   const words = text.trim() ? text.trim().split(/\s+/).length : 0;
 
@@ -223,8 +241,9 @@ export default function DocxEditor({ file, onClose }: { file: OpenedFile; onClos
       toolbar={editor && <DocxToolbar editor={editor} mode={mode} setMode={setMode} canOriginal={!isNew}
         insertImage={insertImage} zoom={zoom} setZoom={setZoom} setup={setup}
         setSetup={(p) => { setSetup(p); setDirty(true); }}
-        findOpen={!!find} toggleFind={() => (find ? closeFind() : setFind({ q: '', repl: '', idx: 0, replace: true }))} />}
-      status={`${words} từ · ${text.length} ký tự${mode === 'original' ? ' · Chế độ xem bố cục gốc (chỉ đọc)' : ''}`}
+        findOpen={!!find} toggleFind={() => (find ? closeFind() : setFind({ q: '', repl: '', idx: 0, replace: true }))}
+        tracking={tracking} changes={changes} />}
+      status={`${words} từ · ${text.length} ký tự${tracking ? ' · Đang theo dõi thay đổi' : ''}${changes ? ` · ${changes} thay đổi` : ''}${mode === 'original' ? ' · Chế độ xem bố cục gốc (chỉ đọc)' : ''}`}
     >
       {find && mode === 'edit' && (
         <form className="xl-find" onSubmit={(e) => { e.preventDefault(); step(1); }}>
@@ -265,11 +284,22 @@ export default function DocxEditor({ file, onClose }: { file: OpenedFile; onClos
   );
 }
 
-function DocxToolbar({ editor, mode, setMode, canOriginal, insertImage, zoom, setZoom, setup, setSetup, findOpen, toggleFind }: {
+function DocxToolbar({ editor, mode, setMode, canOriginal, insertImage, zoom, setZoom, setup, setSetup, findOpen, toggleFind, tracking, changes }: {
   editor: Editor; mode: 'edit' | 'original'; setMode(m: 'edit' | 'original'): void; canOriginal: boolean;
   insertImage(): void; zoom: number; setZoom(fn: (z: number) => number): void;
-  setup: PageSetup; setSetup(p: PageSetup): void; findOpen: boolean; toggleFind(): void;
+  setup: PageSetup; setSetup(p: PageSetup): void; findOpen: boolean; toggleFind(): void; tracking: boolean; changes: number;
 }) {
+  const toggleTrack = () => {
+    if (!tracking) {
+      try {
+        if (!localStorage.getItem('dvd-author')) {
+          const who = prompt('Tên của bạn (hiện bên cạnh các thay đổi)', currentAuthor());
+          if (who?.trim()) localStorage.setItem('dvd-author', who.trim());
+        }
+      } catch { /* không lưu được tên: dùng tên mặc định */ }
+    }
+    editor.chain().focus().setTrackChanges(!tracking).run();
+  };
   const ts = editor.getAttributes('textStyle');
   const family = (ts.fontFamily as string | undefined)?.replace(/["']/g, '').split(',')[0].trim() ?? '';
   const sizePt = ts.fontSize ? Math.round(parseFloat(ts.fontSize) * (String(ts.fontSize).endsWith('px') ? 0.75 : 1)) : '';
@@ -366,6 +396,18 @@ function DocxToolbar({ editor, mode, setMode, canOriginal, insertImage, zoom, se
           <ToolButton icon="🔗" label="Liên kết" active={editor.isActive('link')} onClick={setLink} />
           <ToolButton icon="―" label="Đường kẻ" onClick={() => c().setHorizontalRule().run()} />
           <ToolButton icon="⤓" label="Ngắt trang" onClick={() => c().setPageBreak().run()} />
+          <Sep />
+          <ToolButton icon="📝" label="Theo dõi thay đổi" active={tracking} onClick={toggleTrack} />
+          {(changes > 0 || tracking) && (
+            <>
+              <ToolButton icon="‹" label="Thay đổi trước" onClick={() => c().goToChange(-1).run()} disabled={!changes} />
+              <ToolButton icon="›" label="Thay đổi sau" onClick={() => c().goToChange(1).run()} disabled={!changes} />
+              <ToolButton icon="✓" label="Chấp nhận" onClick={() => c().acceptChange().goToChange(1).run()} disabled={!changes} />
+              <ToolButton icon="✗" label="Từ chối" onClick={() => c().rejectChange().goToChange(1).run()} disabled={!changes} />
+              <ToolButton icon="✓✓" label="Chấp nhận tất cả" onClick={() => c().acceptAllChanges().run()} disabled={!changes} />
+              <ToolButton icon="✗✗" label="Từ chối tất cả" onClick={() => c().rejectAllChanges().run()} disabled={!changes} />
+            </>
+          )}
           <Sep />
           <ToolButton icon="🔍" label="Tìm & thay" active={findOpen} onClick={toggleFind} />
           <label className="tb-field" title="Hướng trang">

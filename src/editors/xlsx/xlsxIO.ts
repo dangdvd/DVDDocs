@@ -1,6 +1,7 @@
 // Đọc/ghi .xlsx bằng ExcelJS. Khi lưu, ghi đè lên workbook gốc để giữ nguyên những gì ta không sửa.
 import ExcelJS from 'exceljs';
-import { Book, Cell, CellStyle, Sheet, addr, dateToSerial, key, parseKey, parseRange, rangeRef } from './sheetModel';
+import { Book, Cell, CellStyle, Engine, Sheet, addr, dateToSerial, key, parseKey, parseRange, rangeRef } from './sheetModel';
+import { ChartData, Chart, chartData, readCharts, writeCharts } from './charts';
 import { uid } from '../../lib/uid';
 
 const argbToHex = (argb?: string) => (argb && argb.length >= 6 ? `#${argb.slice(-6)}` : undefined);
@@ -82,6 +83,10 @@ export async function loadXlsx(data: ArrayBuffer): Promise<LoadedBook> {
     sheet.colCount = Math.max(26, ws.columnCount + 5);
     sheets.push(sheet);
   });
+  try {
+    const charts = await readCharts(data, uid);
+    for (const sh of sheets) { const c = charts.get(sh.name); if (c) sh.charts = c; }
+  } catch { /* biểu đồ hỏng: vẫn mở được dữ liệu */ }
   if (!sheets.length) sheets.push({ id: uid(), name: 'Sheet1', cells: {}, colWidths: {}, rowCount: 100, colCount: 26 });
   return { book: { sheets }, wb, idMap };
 }
@@ -165,6 +170,13 @@ export async function saveXlsx(
   });
   wb.worksheets.filter((ws) => !keep.has(ws.id)).forEach((ws) => wb.removeWorksheet(ws.id));
   order.forEach((ws, i) => ((ws as unknown as { orderNo: number }).orderNo = i));
-  const buf = await wb.xlsx.writeBuffer();
-  return buf instanceof ArrayBuffer ? buf : (new Uint8Array(buf as ArrayBufferLike).buffer as ArrayBuffer);
+  const raw = await wb.xlsx.writeBuffer();
+  const buf = raw instanceof ArrayBuffer ? raw : (new Uint8Array(raw as ArrayBufferLike).buffer as ArrayBuffer);
+  // ExcelJS không ghi biểu đồ: thêm vào gói sau khi ghi.
+  const engine = new Engine(book);
+  const charts = new Map<string, { chart: Chart; data: ChartData }[]>();
+  book.sheets.forEach((s, si) => {
+    if (s.charts?.length) charts.set(s.name, s.charts.map((chart) => ({ chart, data: chartData(chart, book, engine, si) })));
+  });
+  return writeCharts(buf, charts);
 }
