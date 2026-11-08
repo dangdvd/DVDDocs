@@ -1,11 +1,19 @@
 // Chuyển nội dung trình soạn thảo (JSON của TipTap/ProseMirror) sang tệp .docx thật bằng thư viện `docx`.
 import {
-  AlignmentType, BorderStyle, DeletedTextRun, Document, ExternalHyperlink, InsertedTextRun, Footer, HeadingLevel, ImageRun, LevelFormat, Packer,
+  AlignmentType, BorderStyle, DeletedTextRun, Document, ExternalHyperlink, Header, InsertedTextRun, LineRuleType, TableOfContents, Footer, HeadingLevel, ImageRun, LevelFormat, Packer,
   PageBreak, PageNumber, PageOrientation, Paragraph, ParagraphChild, ShadingType, Table, TableCell, TableRow, TextRun, WidthType,
 } from 'docx';
 
 /** Thiết lập trang khi xuất: khổ ngang và đánh số trang ở chân trang. */
-export interface PageSetup { landscape: boolean; pageNumbers: boolean; /** Bật theo dõi thay đổi khi mở trong Word. */ track?: boolean }
+export interface PageSetup {
+  landscape: boolean;
+  pageNumbers: boolean;
+  /** Bật theo dõi thay đổi khi mở trong Word. */
+  track?: boolean;
+  /** Chữ ở đầu trang / chân trang (mỗi dòng một đoạn, căn giữa). */
+  header?: string;
+  footer?: string;
+}
 
 /** "12pt" | "16px" | "1.5em" → nửa điểm (đơn vị cỡ chữ của Word), hoặc undefined. */
 export function halfPoints(size?: string | null): number | undefined {
@@ -79,6 +87,7 @@ const MAX_IMG_W = 600;
 class Converter {
   listInstance = 0;
   revision = 1;
+  hasToc = false;
 
   runs(nodes: PMNode[] = []): ParagraphChild[] {
     const out: ParagraphChild[] = [];
@@ -143,6 +152,7 @@ class Converter {
             children: this.runs(n.content),
             heading: n.type === 'heading' ? HEADINGS[(n.attrs?.level ?? 1) - 1] : undefined,
             alignment: align,
+            ...(Number(n.attrs?.lineHeight) > 0 ? { spacing: { line: Math.round(Number(n.attrs!.lineHeight) * 240), lineRule: LineRuleType.AUTO } } : {}),
             ...(ctx.list
               ? ctx.list.kind === 'bullet'
                 ? { bullet: { level: ctx.list.level } }
@@ -172,6 +182,12 @@ class Converter {
               shading: { type: ShadingType.CLEAR, color: 'auto', fill: 'F3F3F3' },
             }));
           }
+          break;
+        case 'tableOfContents':
+          // Tiêu đề "Mục lục" không dùng kiểu Heading để không tự xuất hiện trong chính mục lục.
+          out.push(new Paragraph({ spacing: { after: 120 }, children: [new TextRun({ text: 'Mục lục', bold: true, size: 32, color: '2F5496' })] }));
+          out.push(new TableOfContents('Mục lục', { hyperlink: true, headingStyleRange: '1-3' }) as unknown as Paragraph);
+          this.hasToc = true;
           break;
         case 'pageBreak':
           out.push(new Paragraph({ children: [new PageBreak()] }));
@@ -203,7 +219,9 @@ class Converter {
           children: children.length ? children : [new Paragraph({ children: [] })],
           columnSpan: (cell.attrs?.colspan ?? 1) > 1 ? cell.attrs!.colspan : undefined,
           rowSpan: (cell.attrs?.rowspan ?? 1) > 1 ? cell.attrs!.rowspan : undefined,
-          shading: cell.type === 'tableHeader' ? { type: ShadingType.CLEAR, color: 'auto', fill: 'EDEFF2' } : undefined,
+          shading: toHex(cell.attrs?.backgroundColor)
+            ? { type: ShadingType.CLEAR, color: 'auto', fill: toHex(cell.attrs?.backgroundColor) }
+            : cell.type === 'tableHeader' ? { type: ShadingType.CLEAR, color: 'auto', fill: 'EDEFF2' } : undefined,
         });
       }),
     }));
@@ -211,13 +229,16 @@ class Converter {
   }
 }
 
+/** Mỗi dòng chữ đầu/chân trang thành một đoạn căn giữa, cỡ 9pt. */
+const lines = (text: string) => text.split('\n').map((t) => new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: t, size: 18 })] }));
+
 export function buildDocument(json: PMNode, setup: PageSetup = { landscape: false, pageNumbers: false }): Document {
   const conv = new Converter();
   const children = conv.blocks(json.content);
   const fmts = [LevelFormat.DECIMAL, LevelFormat.LOWER_LETTER, LevelFormat.LOWER_ROMAN];
   return new Document({
     creator: 'DVDDocs',
-    features: setup.track ? { trackRevisions: true } : undefined,
+    features: setup.track || conv.hasToc ? { trackRevisions: !!setup.track, updateFields: conv.hasToc } : undefined,
     styles: { default: { document: { run: { font: 'Arial', size: 22 } } } },
     numbering: {
       config: [{
@@ -233,13 +254,17 @@ export function buildDocument(json: PMNode, setup: PageSetup = { landscape: fals
     },
     sections: [{
       properties: setup.landscape ? { page: { size: { orientation: PageOrientation.LANDSCAPE } } } : undefined,
-      footers: setup.pageNumbers
+      headers: setup.header?.trim() ? { default: new Header({ children: lines(setup.header) }) } : undefined,
+      footers: setup.pageNumbers || setup.footer?.trim()
         ? {
           default: new Footer({
-            children: [new Paragraph({
-              alignment: AlignmentType.CENTER,
-              children: [new TextRun({ children: ['Trang ', PageNumber.CURRENT, ' / ', PageNumber.TOTAL_PAGES], size: 18 })],
-            })],
+            children: [
+              ...(setup.footer?.trim() ? lines(setup.footer) : []),
+              ...(setup.pageNumbers ? [new Paragraph({
+                alignment: AlignmentType.CENTER,
+                children: [new TextRun({ children: ['Trang ', PageNumber.CURRENT, ' / ', PageNumber.TOTAL_PAGES], size: 18 })],
+              })] : []),
+            ],
           }),
         }
         : undefined,
@@ -249,5 +274,31 @@ export function buildDocument(json: PMNode, setup: PageSetup = { landscape: fals
 }
 
 export async function exportDocx(json: PMNode, setup?: PageSetup): Promise<ArrayBuffer> {
-  return Packer.toArrayBuffer(buildDocument(json, setup));
+  const buf = await Packer.toArrayBuffer(buildDocument(json, setup));
+  return json.content?.some((n) => n.type === 'tableOfContents') ? fillToc(buf, json) : buf;
+}
+
+const xmlEsc = (t: string) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/**
+ * Trường mục lục do thư viện tạo ra để trống cho tới khi Word cập nhật. Điền sẵn danh sách tiêu đề làm kết quả của trường
+ * để các ứng dụng không tự cập nhật (xem trước trên điện thoại, LibreOffice) vẫn thấy mục lục; Word sẽ cập nhật lại kèm số trang.
+ */
+async function fillToc(buf: ArrayBuffer, json: PMNode): Promise<ArrayBuffer> {
+  const { default: JSZip } = await import('jszip');
+  const zip = await JSZip.loadAsync(buf);
+  const xml = await zip.file('word/document.xml')!.async('string');
+  const heads: { level: number; text: string }[] = [];
+  const walk = (nodes: PMNode[] = []) => nodes.forEach((n) => {
+    if (n.type === 'heading' && (n.attrs?.level ?? 1) <= 3) {
+      const text = (n.content ?? []).map((c) => c.text ?? '').join('');
+      if (text.trim()) heads.push({ level: n.attrs?.level ?? 1, text });
+    } else walk(n.content);
+  });
+  walk(json.content);
+  const entries = heads.map((h) => `<w:p><w:pPr><w:pStyle w:val="TOC${h.level}"/><w:ind w:left="${(h.level - 1) * 440}"/></w:pPr><w:r><w:t xml:space="preserve">${xmlEsc(h.text)}</w:t></w:r></w:p>`).join('');
+  const marker = '<w:fldChar w:fldCharType="separate"/></w:r></w:p>';
+  if (!xml.includes(marker)) return buf;
+  zip.file('word/document.xml', xml.replace(marker, marker + entries));
+  return zip.generateAsync({ type: 'arraybuffer' });
 }

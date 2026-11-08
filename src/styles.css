@@ -250,3 +250,41 @@ textarea.form-field { padding-top: 1px; line-height: 1.2; }
 .pdf-tline { position: absolute; border-radius: 2px; outline: 1px dashed rgba(31, 111, 235, .45); background: rgba(31, 111, 235, .05); pointer-events: none; }
 .annot-edit { line-height: 1.2; box-shadow: 0 0 0 1px rgba(31, 111, 235, .35); }
 .annot-edit textarea { line-height: 1.2; margin-top: -0.06em; min-width: 0; white-space: pre; }
+
+/* Word: đầu/chân trang, mục lục, hộp thoại */
+.docx-hf { white-space: pre-wrap; text-align: center; font-size: 9pt; color: #777; cursor: pointer; border: 1px dashed transparent; padding: 2px 4px; border-radius: 4px; }
+.docx-hf:hover { border-color: #c8cdd5; }
+.docx-hf.top { margin: -28px 0 16px; }
+.docx-hf.bottom { margin: 16px 0 -28px; }
+.hf-dialog { display: flex; flex-direction: column; gap: 10px; }
+.hf-dialog label { display: flex; flex-direction: column; gap: 4px; font-size: .9rem; }
+.hf-dialog label.row { flex-direction: row; align-items: center; gap: 8px; }
+.hf-dialog textarea { font: inherit; padding: 6px 8px; border: 1px solid var(--border, #ccd); border-radius: 8px; background: var(--bg, #fff); color: inherit; resize: vertical; }
+.hf-dialog .modal-actions { justify-content: flex-end; }
+.ProseMirror .toc { border: 1px solid #d7dbe2; border-radius: 6px; padding: 10px 14px; margin: 10px 0; background: #fafbfc; user-select: none; }
+.ProseMirror .toc.ProseMirror-selectednode { outline: 2px solid var(--accent); }
+.ProseMirror .toc-title { font-weight: 700; font-size: 1.1em; margin-bottom: 6px; }
+.ProseMirror .toc-item { padding: 1px 0; color: #1f3b63; }
+.ProseMirror .toc-item.l2 { padding-left: 1.5em; }
+.ProseMirror .toc-item.l3 { padding-left: 3em; font-size: .95em; }
+.ProseMirror .toc-empty { color: #888; font-style: italic; }
+@media print { .docx-hf { display: none; } .ProseMirror .toc { border: none; background: none; } }
+
+/* Excel: lọc dữ liệu và định dạng có điều kiện */
+.xl-fbtn { position: absolute; right: 1px; top: 50%; transform: translateY(-50%); width: 18px; height: 18px; padding: 0; border: 1px solid #b9c0cc; border-radius: 3px; background: #f4f6f9; color: #333; font-size: 11px; line-height: 16px; cursor: pointer; z-index: 1; }
+.xl-fbtn.on { background: #dbe8ff; border-color: #2b6cd8; color: #1b4fa8; }
+.xl-fpop, .xl-cfdlg { display: flex; flex-direction: column; gap: 10px; max-height: calc(100dvh - 32px); overflow: auto; }
+.xl-fpop label.row, .xl-cfdlg label.row { flex-direction: row; display: flex; align-items: center; gap: 8px; }
+.xl-fpop input:not([type]), .xl-cfdlg input:not([type]), .xl-cfdlg select { font: inherit; padding: 6px 8px; border: 1px solid var(--border, #ccd); border-radius: 8px; background: var(--bg, #fff); color: inherit; }
+.xl-fpop-sort { display: flex; gap: 8px; }
+.xl-fpop-list { max-height: 260px; overflow: auto; display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--border, #ccd); border-radius: 8px; padding: 8px; }
+.xl-cfdlg > label { display: flex; flex-direction: column; gap: 4px; }
+.xl-cf-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+.xl-cf-row > label { display: flex; flex-direction: column; gap: 4px; font-size: .9rem; }
+.xl-cf-sample { display: inline-block; min-width: 64px; padding: 4px 8px; border-radius: 4px; border: 1px solid #ccd; text-align: center; }
+.xl-cf-list { display: flex; flex-direction: column; gap: 6px; }
+.xl-cf-item { display: flex; align-items: center; gap: 8px; font-size: .9rem; }
+.xl-cf-item > span:nth-child(2) { flex: 1; }
+.xl-fpop .modal-actions, .xl-cfdlg .modal-actions { flex-wrap: wrap; }
+.annot-text textarea.font-serif { font-family: 'DejaVu Serif', 'Times New Roman', serif; }
+.annot-text textarea.font-mono { font-family: 'DejaVu Sans Mono', 'Courier New', monospace; }

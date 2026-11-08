@@ -5,10 +5,10 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 
 const FILTERS = [
-  { name: 'Tài liệu', extensions: ['pdf', 'docx', 'xlsx'] },
+  { name: 'Tài liệu', extensions: ['pdf', 'docx', 'xlsx', 'csv', 'tsv'] },
   { name: 'PDF', extensions: ['pdf'] },
   { name: 'Word', extensions: ['docx'] },
-  { name: 'Excel', extensions: ['xlsx'] },
+  { name: 'Excel', extensions: ['xlsx', 'csv', 'tsv'] },
 ];
 
 // Phục vụ giao diện qua giao thức riêng app:// (thay vì file://) để fetch, worker và IndexedDB hoạt động như trên web.

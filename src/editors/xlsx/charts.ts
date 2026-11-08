@@ -26,7 +26,11 @@ export interface Chart {
   series: ChartSeries[];
   /** Vị trí theo ô: góc trên trái (r0, c0) đến góc dưới phải (r1, c1), không bao gồm hàng/cột r1/c1. */
   anchor: Merge;
+  /** XML gốc của biểu đồ đọc từ tệp, và dấu của (loại, tiêu đề, dữ liệu) lúc đọc: chưa sửa thì ghi lại nguyên kiểu gốc. */
+  raw?: { xml: string; sig: string };
 }
+
+export const chartSig = (c: Pick<Chart, 'kind' | 'title' | 'series'>) => JSON.stringify([c.kind, c.title ?? '', c.series]);
 
 export const PALETTE = ['#4472C4', '#ED7D31', '#A5A5A5', '#FFC000', '#5B9BD5', '#70AD47', '#264478', '#9E480E', '#636363', '#997300'];
 
@@ -153,7 +157,7 @@ function parseRels(xml: string | undefined): Map<string, { target: string; type:
 }
 
 /** Danh sách trang tính theo thứ tự: tên và đường dẫn tệp XML. */
-async function sheetParts(zip: JSZip): Promise<{ name: string; path: string }[]> {
+export async function sheetParts(zip: JSZip): Promise<{ name: string; path: string }[]> {
   const wb = await zip.file('xl/workbook.xml')?.async('string');
   const rels = parseRels(await zip.file('xl/_rels/workbook.xml.rels')?.async('string'));
   const out: { name: string; path: string }[] = [];
@@ -199,7 +203,8 @@ export function parseChartXml(xml: string): Omit<Chart, 'id' | 'anchor'> | null 
   if (!series.length) return null;
   const t = tag(tag(xml, 'chart')?.[1] ?? xml, 'title');
   const title = t ? [...(t[1] ?? '').matchAll(/<a:t>([^<]*)<\/a:t>/g)].map((x) => unesc(x[1])).join('') : '';
-  return { kind, title: title || undefined, series };
+  const out = { kind, title: title || undefined, series };
+  return { ...out, raw: { xml, sig: chartSig(out) } };
 }
 
 const num = (xml: string, name: string) => Number(tag(xml, name)?.[1] ?? 0);
@@ -288,6 +293,24 @@ export function chartXml(chart: Chart, data: ChartData): string {
     `<c:legend><c:legendPos val="${isPie ? 'r' : 'b'}"/><c:overlay val="0"/></c:legend><c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart></c:chartSpace>`;
 }
 
+/**
+ * Biểu đồ gốc chưa bị sửa: giữ nguyên XML (màu, kiểu, nhãn…), chỉ cập nhật giá trị lưu sẵn theo dữ liệu hiện tại
+ * và bỏ các phần tham chiếu tới tệp phụ không được chép theo (dữ liệu nhúng, hình vẽ thêm).
+ */
+export function refreshRaw(xml: string, data: ChartData): string {
+  let i = 0;
+  xml = xml.replace(/<c:ser>([\s\S]*?)<\/c:ser>/g, (_m, body: string) => {
+    const d = data.series[i++];
+    if (d) {
+      body = body.replace(/(<c:(?:val|yVal)>[\s\S]*?<c:numRef>[\s\S]*?<\/c:f>)\s*<c:numCache>[\s\S]*?<\/c:numCache>/, `$1${cacheXml('num', d.values)}`);
+      body = body.replace(/(<c:(?:cat|xVal)>[\s\S]*?<c:strRef>[\s\S]*?<\/c:f>)\s*<c:strCache>[\s\S]*?<\/c:strCache>/, `$1${cacheXml('str', data.cats)}`);
+      body = body.replace(/(<c:tx>\s*<c:strRef>[\s\S]*?<\/c:f>)\s*<c:strCache>[\s\S]*?<\/c:strCache>/, `$1${cacheXml('str', [d.name])}`);
+    }
+    return `<c:ser>${body}</c:ser>`;
+  });
+  return xml.replace(/<c:externalData\b[\s\S]*?<\/c:externalData>|<c:externalData\b[^>]*\/>/g, '').replace(/<c:userShapes\b[^>]*\/>/g, '');
+}
+
 function anchorXml(chart: Chart, rid: string, id: number) {
   const { r0, c0, r1, c1 } = chart.anchor;
   const pos = (t: string, r: number, c: number) => `<xdr:${t}><xdr:col>${c}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${r}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:${t}>`;
@@ -368,7 +391,7 @@ export async function writeCharts(buf: ArrayBuffer, charts: Map<string, { chart:
     let anchors = '';
     for (const { chart, data } of list) {
       const path = `xl/charts/chart${chartNo++}.xml`;
-      zip.file(path, chartXml(chart, data));
+      zip.file(path, chart.raw && chart.raw.sig === chartSig(chart) ? refreshRaw(chart.raw.xml, data) : chartXml(chart, data));
       ct = ct.replace('</Types>', `<Override PartName="/${path}" ContentType="${CT_CHART}"/></Types>`);
       const rid = nextRid(dRels);
       dRels.set(rid, { target: '', type: REL_CHART });

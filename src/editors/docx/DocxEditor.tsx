@@ -19,7 +19,8 @@ import JSZip from 'jszip';
 import { OpenedFile, saveFile } from '../../lib/fileio';
 import { EditorShell, Sep, ToolButton } from '../../components/EditorShell';
 import { exportDocx, PageSetup, PMNode } from './docxExport';
-import { FontSize, PageBreak, SearchHighlight, findInDoc, searchKey } from './extensions';
+import { FontSize, LineHeight, PageBreak, SearchHighlight, TableOfContents, cellBackground, findInDoc, searchKey } from './extensions';
+import { formattingToHtml, headerFooterText, markFormatting } from './docxImport';
 import { TrackChanges, currentAuthor, listChanges, markTrackedRuns, trackKey, trackedMarkersToHtml } from './trackChanges';
 
 const FONTS = ['Arial', 'Calibri', 'Cambria', 'Times New Roman', 'Tahoma', 'Verdana', 'Georgia', 'Courier New'];
@@ -34,8 +35,9 @@ async function docxToHtml(data: ArrayBuffer): Promise<{ html: string; warnings: 
   try {
     const zip = await JSZip.loadAsync(data);
     const xml = await zip.file('word/document.xml')?.async('string');
-    if (xml && /<w:(ins|del)\b/.test(xml)) {
-      zip.file('word/document.xml', markTrackedRuns(xml));
+    if (xml) {
+      // Giữ màu chữ, tô nền, căn lề, giãn dòng, màu ô và các thay đổi được theo dõi.
+      zip.file('word/document.xml', markTrackedRuns(markFormatting(xml)));
       data = await zip.generateAsync({ type: 'arraybuffer' });
     }
   } catch { /* tệp lạ: để mammoth tự xử lý */ }
@@ -63,7 +65,7 @@ async function docxToHtml(data: ArrayBuffer): Promise<{ html: string; warnings: 
     .replace(/<p>\s*<hr class="page-break" \/>\s*<\/p>/g, '<hr class="page-break" />')
     .replace(/\uE000([^\uE001<>"]*)\uE001/g, '<span style="$1">')
     .replace(/\uE002/g, '</span>');
-  html = trackedMarkersToHtml(html);
+  html = formattingToHtml(trackedMarkersToHtml(html));
   return { html, warnings: res.messages.filter((m) => m.type === 'warning').map((m) => m.message) };
 }
 
@@ -79,9 +81,21 @@ async function readPageSetup(data: ArrayBuffer): Promise<PageSetup> {
     for (const name of Object.keys(zip.files).filter((n) => /^word\/footer\d*\.xml$/.test(n))) {
       if (/\bPAGE\b/.test(await zip.file(name)!.async('string'))) pageNumbers = true;
     }
+    // Chữ đầu/chân trang mặc định của mục đầu tiên.
+    const rels = (await zip.file('word/_rels/document.xml.rels')?.async('string')) ?? '';
+    const partText = async (kind: 'header' | 'footer') => {
+      const id = new RegExp(`<w:${kind}Reference\\b[^>]*w:type="default"[^>]*r:id="([^"]+)"|<w:${kind}Reference\\b[^>]*r:id="([^"]+)"[^>]*w:type="default"`).exec(xml);
+      const rid = id?.[1] ?? id?.[2];
+      const target = rid ? new RegExp(`<Relationship\\b[^>]*Id="${rid}"[^>]*Target="([^"]+)"|<Relationship\\b[^>]*Target="([^"]+)"[^>]*Id="${rid}"`).exec(rels) : null;
+      const file = target ? `word/${(target[1] ?? target[2]).replace(/^\/?word\//, '')}` : null;
+      const part = file ? await zip.file(file)?.async('string') : undefined;
+      return part ? headerFooterText(part) : '';
+    };
+    const header = await partText('header');
+    const footer = await partText('footer');
     const settings = (await zip.file('word/settings.xml')?.async('string')) ?? '';
     const track = /<w:trackRevisions\b(?![^>]*w:val="(false|0|off)")/.test(settings);
-    return { landscape, pageNumbers, track };
+    return { landscape, pageNumbers, track, header, footer };
   } catch {
     return { landscape: false, pageNumbers: false };
   }
@@ -99,6 +113,7 @@ export default function DocxEditor({ file, onClose }: { file: OpenedFile; onClos
   const [zoom, setZoom] = useState(1);
   const [, force] = useState(0);
   const [setup, setSetup] = useState<PageSetup>({ landscape: false, pageNumbers: false });
+  const [hfEdit, setHfEdit] = useState(false);
   const [find, setFind] = useState<{ q: string; repl: string; idx: number; replace: boolean } | null>(null);
   const originalRef = useRef<HTMLDivElement>(null);
 
@@ -114,14 +129,16 @@ export default function DocxEditor({ file, onClose }: { file: OpenedFile; onClos
       Superscript,
       Link.configure({ openOnClick: false, autolink: true, HTMLAttributes: { rel: 'noopener noreferrer', target: null } }),
       PageBreak,
+      LineHeight,
+      TableOfContents,
       SearchHighlight,
       TrackChanges,
       Highlight.configure({ multicolor: true }),
       TextAlign.configure({ types: ['heading', 'paragraph'] }),
       Table.configure({ resizable: true }),
       TableRow,
-      TableHeader,
-      TableCell,
+      TableHeader.extend({ addAttributes() { return { ...this.parent?.(), ...cellBackground }; } }),
+      TableCell.extend({ addAttributes() { return { ...this.parent?.(), ...cellBackground }; } }),
       Image.configure({ allowBase64: true }),
     ],
     content: isNew ? '<h1>Tài liệu mới</h1><p></p>' : '',
@@ -242,7 +259,7 @@ export default function DocxEditor({ file, onClose }: { file: OpenedFile; onClos
         insertImage={insertImage} zoom={zoom} setZoom={setZoom} setup={setup}
         setSetup={(p) => { setSetup(p); setDirty(true); }}
         findOpen={!!find} toggleFind={() => (find ? closeFind() : setFind({ q: '', repl: '', idx: 0, replace: true }))}
-        tracking={tracking} changes={changes} />}
+        tracking={tracking} changes={changes} openHeaderFooter={() => setHfEdit(true)} />}
       status={`${words} từ · ${text.length} ký tự${tracking ? ' · Đang theo dõi thay đổi' : ''}${changes ? ` · ${changes} thay đổi` : ''}${mode === 'original' ? ' · Chế độ xem bố cục gốc (chỉ đọc)' : ''}`}
     >
       {find && mode === 'edit' && (
@@ -274,20 +291,49 @@ export default function DocxEditor({ file, onClose }: { file: OpenedFile; onClos
         {mode === 'edit' ? (
           <div className={`docx-page${setup.landscape ? ' landscape' : ''}`} style={{ zoom }}>
             {setup.landscape && <style>{'@page { size: A4 landscape; }'}</style>}
+            {(setup.header || hfEdit) && (
+              <div className="docx-hf top" onClick={() => setHfEdit(true)} title="Bấm để sửa đầu trang">{setup.header || 'Đầu trang'}</div>
+            )}
             <EditorContent editor={editor} />
+            {(setup.footer || setup.pageNumbers) && (
+              <div className="docx-hf bottom" onClick={() => setHfEdit(true)} title="Bấm để sửa chân trang">
+                {setup.footer}{setup.footer && setup.pageNumbers ? '\n' : ''}{setup.pageNumbers ? 'Trang x / y' : ''}
+              </div>
+            )}
           </div>
         ) : (
           <div className="docx-original" ref={originalRef} />
         )}
       </div>
+      {hfEdit && (
+        <div className="modal-backdrop" onClick={() => setHfEdit(false)}>
+          <form className="modal hf-dialog" onClick={(e) => e.stopPropagation()} onSubmit={(e) => {
+            e.preventDefault();
+            const f = new FormData(e.currentTarget);
+            setSetup({ ...setup, header: String(f.get('header') ?? ''), footer: String(f.get('footer') ?? ''), pageNumbers: f.get('pn') === 'on' });
+            setDirty(true);
+            setHfEdit(false);
+          }}>
+            <h3>Đầu trang và chân trang</h3>
+            <label>Đầu trang<textarea name="header" rows={2} defaultValue={setup.header ?? ''} placeholder="Ví dụ: CÔNG TY ABC – Báo cáo nội bộ" /></label>
+            <label>Chân trang<textarea name="footer" rows={2} defaultValue={setup.footer ?? ''} placeholder="Ví dụ: Địa chỉ, số điện thoại…" /></label>
+            <label className="row"><input type="checkbox" name="pn" defaultChecked={setup.pageNumbers} /> Đánh số trang ("Trang x / y")</label>
+            <div className="modal-actions">
+              <button type="button" className="btn" onClick={() => setHfEdit(false)}>Huỷ</button>
+              <button type="submit" className="btn primary">Xong</button>
+            </div>
+          </form>
+        </div>
+      )}
     </EditorShell>
   );
 }
 
-function DocxToolbar({ editor, mode, setMode, canOriginal, insertImage, zoom, setZoom, setup, setSetup, findOpen, toggleFind, tracking, changes }: {
+function DocxToolbar({ editor, mode, setMode, canOriginal, insertImage, zoom, setZoom, setup, setSetup, findOpen, toggleFind, tracking, changes, openHeaderFooter }: {
   editor: Editor; mode: 'edit' | 'original'; setMode(m: 'edit' | 'original'): void; canOriginal: boolean;
   insertImage(): void; zoom: number; setZoom(fn: (z: number) => number): void;
   setup: PageSetup; setSetup(p: PageSetup): void; findOpen: boolean; toggleFind(): void; tracking: boolean; changes: number;
+  openHeaderFooter(): void;
 }) {
   const toggleTrack = () => {
     if (!tracking) {
@@ -374,6 +420,13 @@ function DocxToolbar({ editor, mode, setMode, canOriginal, insertImage, zoom, se
           <ToolButton icon="↔" label="Căn giữa" active={editor.isActive({ textAlign: 'center' })} onClick={() => c().setTextAlign('center').run()} />
           <ToolButton icon="⇥" label="Căn phải" active={editor.isActive({ textAlign: 'right' })} onClick={() => c().setTextAlign('right').run()} />
           <ToolButton icon="☰" label="Căn đều" active={editor.isActive({ textAlign: 'justify' })} onClick={() => c().setTextAlign('justify').run()} />
+          <label className="tb-field" title="Giãn dòng">
+            <select value={(editor.getAttributes('paragraph').lineHeight ?? editor.getAttributes('heading').lineHeight ?? '') as string}
+              onChange={(e) => c().setLineHeight(e.target.value || null).run()}>
+              <option value="">Giãn dòng</option>
+              {['1', '1.15', '1.5', '2', '2.5', '3'].map((v) => <option key={v} value={v}>{v.replace('.', ',')}</option>)}
+            </select>
+          </label>
           <Sep />
           <ToolButton icon="•" label="Dấu đầu dòng" active={editor.isActive('bulletList')} onClick={() => c().toggleBulletList().run()} />
           <ToolButton icon="1." label="Đánh số" active={editor.isActive('orderedList')} onClick={() => c().toggleOrderedList().run()} />
@@ -389,6 +442,11 @@ function DocxToolbar({ editor, mode, setMode, canOriginal, insertImage, zoom, se
               <ToolButton icon="−↓" label="Xoá hàng" onClick={() => c().deleteRow().run()} />
               <ToolButton icon="−→" label="Xoá cột" onClick={() => c().deleteColumn().run()} />
               <ToolButton icon="⊞" label="Gộp/tách ô" onClick={() => c().mergeOrSplit().run()} />
+              <label className="tb-field" title="Màu nền ô">
+                <span className="tb-mini">▦</span>
+                <input type="color" defaultValue="#fff2cc" onChange={(e) => c().setCellAttribute('backgroundColor', e.target.value).run()} />
+              </label>
+              <ToolButton icon="∅" label="Bỏ màu ô" onClick={() => c().setCellAttribute('backgroundColor', null).run()} />
               <ToolButton icon="✕▦" label="Xoá bảng" onClick={() => c().deleteTable().run()} />
             </>
           )}
@@ -396,6 +454,7 @@ function DocxToolbar({ editor, mode, setMode, canOriginal, insertImage, zoom, se
           <ToolButton icon="🔗" label="Liên kết" active={editor.isActive('link')} onClick={setLink} />
           <ToolButton icon="―" label="Đường kẻ" onClick={() => c().setHorizontalRule().run()} />
           <ToolButton icon="⤓" label="Ngắt trang" onClick={() => c().setPageBreak().run()} />
+          <ToolButton icon="≣" label="Mục lục" onClick={() => c().insertTableOfContents().run()} />
           <Sep />
           <ToolButton icon="📝" label="Theo dõi thay đổi" active={tracking} onClick={toggleTrack} />
           {(changes > 0 || tracking) && (
@@ -417,6 +476,7 @@ function DocxToolbar({ editor, mode, setMode, canOriginal, insertImage, zoom, se
             </select>
           </label>
           <ToolButton icon="#" label="Số trang" active={setup.pageNumbers} onClick={() => setSetup({ ...setup, pageNumbers: !setup.pageNumbers })} />
+          <ToolButton icon="▭" label="Đầu/chân trang" active={!!(setup.header || setup.footer)} onClick={openHeaderFooter} />
           <Sep />
           <ToolButton icon="−" label="Thu nhỏ" onClick={() => setZoom((z) => Math.max(0.5, +(z - 0.1).toFixed(2)))} />
           <span className="tb-zoom">{Math.round(zoom * 100)}%</span>

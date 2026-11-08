@@ -9,32 +9,30 @@ import {
 import { SignaturePad } from './SignaturePad';
 import { EditorShell, ToolButton, Sep } from '../../components/EditorShell';
 import { uid } from '../../lib/uid';
+import { guessFont, previewFamily, registerPreviewFonts } from './fonts';
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
 // Phông chữ dùng khi xem trước chữ chèn vào PDF, trùng với phông được nhúng khi lưu (hỗ trợ tiếng Việt).
-if (typeof FontFace !== 'undefined') {
-  const face = new FontFace('DejaVu Sans', `url(${new URL('fonts/DejaVuSans.ttf', document.baseURI).href})`);
-  face.load().then((f) => document.fonts.add(f)).catch(() => {});
-}
+registerPreviewFonts();
 
 type Tool = 'select' | 'edittext' | 'text' | 'highlight' | 'rect' | 'whiteout' | 'ink' | 'place';
 /** Một dòng chữ có sẵn trong trang (pt, gốc trên-trái), ghép từ các đoạn chữ cùng đường chân chữ. */
-type TextLine = { x: number; y: number; w: number; h: number; size: number; text: string };
+type TextLine = { x: number; y: number; w: number; h: number; size: number; text: string; fontName?: string; family?: string };
 
 /** Đọc các dòng chữ của một trang để sửa trực tiếp. */
 async function readLines(doc: PDFDocumentProxy, index: number): Promise<TextLine[]> {
   const page = await doc.getPage(index + 1);
   const vp = page.getViewport({ scale: 1 });
   const tc = await page.getTextContent();
-  const items: { x: number; base: number; w: number; size: number; str: string }[] = [];
+  const items: { x: number; base: number; w: number; size: number; str: string; font: string }[] = [];
   for (const it of tc.items) {
     if (!('str' in it) || !it.str) continue;
     const t = pdfjs.Util.transform(vp.transform, it.transform);
     // Chỉ chữ nằm ngang (theo hướng hiển thị).
     if (Math.abs(t[1]) > 0.01 * Math.abs(t[0]) || t[0] <= 0) continue;
     const size = Math.hypot(t[2], t[3]) || 10;
-    items.push({ x: t[4], base: t[5], w: it.width * (vp.scale || 1), size, str: it.str });
+    items.push({ x: t[4], base: t[5], w: it.width * (vp.scale || 1), size, str: it.str, font: it.fontName });
   }
   items.sort((a, b) => a.base - b.base || a.x - b.x);
   const lines: (TextLine & { base: number })[] = [];
@@ -47,7 +45,7 @@ async function readLines(doc: PDFDocumentProxy, index: number): Promise<TextLine
       last.w = Math.max(last.w, it.x + it.w - last.x);
       last.size = Math.max(last.size, it.size);
     } else {
-      lines.push({ x: it.x, base: it.base, w: it.w, size: it.size, text: it.str, y: 0, h: 0 });
+      lines.push({ x: it.x, base: it.base, w: it.w, size: it.size, text: it.str, y: 0, h: 0, fontName: it.font, family: tc.styles[it.font]?.fontFamily });
     }
   }
   return lines
@@ -363,9 +361,22 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
   const pickLine = (page: number, l: TextLine) => {
     const canvas = pagesRef.current?.querySelector<HTMLCanvasElement>(`.pdf-page[data-page="${page}"] canvas`) ?? null;
     const { bg, fg } = sampleColors(canvas, sizes[page].w, l);
-    const a: Annot = { id: uid(), page, type: 'edit', x: l.x, y: l.y, w: l.w, h: l.h, text: l.text, size: +l.size.toFixed(2), color: fg, bg };
+    const a: Annot = {
+      id: uid(), page, type: 'edit', x: l.x, y: l.y, w: l.w, h: l.h, text: l.text, size: +l.size.toFixed(2), color: fg, bg,
+      font: guessFont(undefined, { family: l.family }),
+    };
     addAnnot(a);
     setSelected(a.id);
+    // Tên phông thật (có sau khi trang đã vẽ): đoán chính xác hơn kiểu chữ có chân, đậm, nghiêng.
+    if (doc && l.fontName) {
+      doc.getPage(page + 1).then((pg) => {
+        const objs = pg.commonObjs as unknown as { has(id: string): boolean; get(id: string): { name?: string; bold?: boolean; italic?: boolean; black?: boolean } };
+        if (!objs.has(l.fontName!)) return;
+        const f = objs.get(l.fontName!);
+        const font = guessFont(f.name, { family: l.family, bold: f.bold || f.black, italic: f.italic });
+        setAnnots((list) => list.map((x) => (x.id === a.id && x.type === 'edit' ? { ...x, font } : x)));
+      }).catch(() => {});
+    }
   };
 
   const updateAnnot = (id: string, patch: Partial<Annot>, record = false) => {
@@ -562,6 +573,23 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
               {[8, 10, 11, 12, 14, 16, 18, 24, 32, 48].map((s) => <option key={s} value={s}>{s}</option>)}
             </select>
           </label>
+          {selAnnot?.type === 'edit' && (() => {
+            const f = selAnnot.font ?? { family: 'sans' as const, bold: false, italic: false };
+            const set = (patch: Partial<typeof f>) => updateAnnot(selAnnot.id, { font: { ...f, ...patch } }, true);
+            return (
+              <>
+                <label className="tb-field" title="Kiểu phông">
+                  <select value={f.family} onChange={(e) => set({ family: e.target.value as typeof f.family })}>
+                    <option value="sans">Không chân</option>
+                    <option value="serif">Có chân</option>
+                    <option value="mono">Đơn cách</option>
+                  </select>
+                </label>
+                <ToolButton icon={<b>B</b>} label="Đậm" active={f.bold} onClick={() => set({ bold: !f.bold })} />
+                <ToolButton icon={<i>I</i>} label="Nghiêng" active={f.italic} onClick={() => set({ italic: !f.italic })} />
+              </>
+            );
+          })()}
           {selected && <ToolButton icon="🗑" label="Xoá" onClick={removeSelected} />}
           <Sep />
           <ToolButton icon="−" label="Thu nhỏ" onClick={() => zoomTo(zoom / 1.25)} />
@@ -1006,8 +1034,12 @@ function AnnotLayer(p: LayerProps) {
               <textarea
                 autoFocus
                 value={a.text}
+                className={`font-${previewFamily(a.font, a.text)}`}
                 rows={Math.max(1, a.text.split('\n').length)}
-                style={{ width: `max(${a.w * z}px, ${Math.max(1, ...a.text.split('\n').map((l) => l.length)) * 0.62 + 0.6}em)` }}
+                style={{
+                  width: `max(${a.w * z}px, ${Math.max(1, ...a.text.split('\n').map((l) => l.length)) * 0.62 + 0.6}em)`,
+                  fontWeight: a.font?.bold ? 700 : undefined, fontStyle: a.font?.italic ? 'italic' : undefined,
+                }}
                 onFocus={() => p.onSelect(a.id)}
                 onChange={(e) => p.onUpdate(a.id, { text: e.target.value })}
               />
