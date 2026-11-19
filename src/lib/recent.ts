@@ -1,29 +1,13 @@
 // Lưu các tệp mở gần đây trong IndexedDB của thiết bị (không gửi đi đâu cả).
 import type { DocKind, OpenedFile } from './fileio';
+import { tx as dbTx } from './db';
 
 export interface RecentEntry { id: string; name: string; kind: DocKind; size: number; openedAt: number; path?: string }
 
-const DB = 'dvddocs';
-const STORE = 'recent';
 const MAX = 12;
 const MAX_BYTES = 30 * 1024 * 1024;
 
-function open(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB, 1);
-    req.onupgradeneeded = () => req.result.createObjectStore(STORE, { keyPath: 'id' });
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-function tx<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBRequest<T>): Promise<T> {
-  return open().then((db) => new Promise<T>((resolve, reject) => {
-    const req = fn(db.transaction(STORE, mode).objectStore(STORE));
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  }));
-}
+const tx = <T,>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBRequest<T>) => dbTx<T>('recent', mode, fn);
 
 export async function listRecent(): Promise<RecentEntry[]> {
   try {

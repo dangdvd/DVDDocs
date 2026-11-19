@@ -8,10 +8,18 @@ export interface OpenedFile {
   data: ArrayBuffer;
   /** Đường dẫn trên máy tính (chỉ có khi chạy Electron). */
   path?: string;
+  /** Mở lại từ bản nháp tự động lưu: id bản nháp để tiếp tục ghi đè lên nó. */
+  draftId?: string;
+  /** Nội dung là bản nháp chưa lưu vào tệp (hiện dấu "chưa lưu" ngay khi mở). */
+  restored?: boolean;
 }
 
 interface DesktopBridge {
   openFile(): Promise<{ name: string; path: string; data: ArrayBuffer } | null>;
+  /** Tệp được mở bằng nhấp đúp / "Mở bằng" lúc khởi động ứng dụng. */
+  getLaunchFile?(): Promise<{ name: string; path: string; data: ArrayBuffer } | null>;
+  /** Nhận tệp được mở từ hệ điều hành khi ứng dụng đang chạy. Trả về hàm huỷ đăng ký. */
+  onOpenFile?(cb: (f: { name: string; path: string; data: ArrayBuffer }) => void): () => void;
   saveFile(opts: { name: string; path?: string; data: ArrayBuffer; saveAs?: boolean }): Promise<string | null>;
 }
 
@@ -50,14 +58,18 @@ export async function fileToOpened(file: File): Promise<OpenedFile> {
   return { name: file.name, kind, data: await file.arrayBuffer() };
 }
 
+/** Tệp do bản máy tính đọc từ ổ đĩa → tệp đang mở. */
+export function desktopToOpened(res: { name: string; path: string; data: ArrayBuffer } | null): OpenedFile | null {
+  if (!res) return null;
+  const kind = kindFromName(res.name);
+  if (!kind) throw new Error(`Định dạng không hỗ trợ: ${res.name}`);
+  return { name: res.name, path: res.path, data: res.data, kind };
+}
+
 /** Mở hộp thoại chọn tệp. Trên máy tính dùng hộp thoại hệ điều hành; nơi khác dùng input file. */
 export async function pickFile(): Promise<OpenedFile | null> {
   if (window.dvdDesktop) {
-    const res = await window.dvdDesktop.openFile();
-    if (!res) return null;
-    const kind = kindFromName(res.name);
-    if (!kind) throw new Error(`Định dạng không hỗ trợ: ${res.name}`);
-    return { ...res, kind };
+    return desktopToOpened(await window.dvdDesktop.openFile());
   }
   return new Promise((resolve, reject) => {
     const input = document.createElement('input');
