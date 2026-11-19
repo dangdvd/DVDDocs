@@ -3,10 +3,12 @@ import * as pdfjs from 'pdfjs-dist';
 import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { OpenedFile, pickFile, saveFile } from '../../lib/fileio';
+import { useDraftAutosave } from '../../lib/drafts';
 import {
   Annot, FieldValues, applyAnnotations, deletePage, extractPages, insertBlankPage, mergePdf, movePage, parsePageRanges, rotatePage,
 } from './pdfOps';
 import { SignaturePad } from './SignaturePad';
+import { OutlineItem, readOutline } from './outline';
 import { EditorShell, ToolButton, Sep } from '../../components/EditorShell';
 import { uid } from '../../lib/uid';
 import { guessFont, previewFamily, registerPreviewFonts } from './fonts';
@@ -162,7 +164,7 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
   const [showThumbs, setShowThumbs] = useState(() => window.innerWidth > 800);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [dirty, setDirty] = useState(false);
+  const [dirty, setDirty] = useState(!!file.restored);
   const [path, setPath] = useState(file.path);
   const [query, setQuery] = useState('');
   const [hits, setHits] = useState<Hit[] | null>(null);
@@ -172,6 +174,12 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
   const [formEdits, setFormEdits] = useState<FieldValues>({});
   const [curPage, setCurPage] = useState(0);
   const [lines, setLines] = useState<Record<number, TextLine[]>>({});
+  /** PDF có mật khẩu mở: chỉ xem, tìm và in (thư viện ghi tệp không giải mã được nội dung). */
+  const [locked, setLocked] = useState(false);
+  const [askPw, setAskPw] = useState<{ retry: boolean; answer(pw: string | null): void } | null>(null);
+  const password = useRef<string | undefined>(undefined);
+  const [outline, setOutline] = useState<OutlineItem[]>([]);
+  const [side, setSide] = useState<'pages' | 'outline'>('pages');
   const scrollRef = useRef<HTMLDivElement>(null);
   const pagesRef = useRef<HTMLDivElement>(null);
   const fitted = useRef(false);
@@ -261,7 +269,19 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
   // Nạp tài liệu vào pdf.js mỗi khi nội dung thay đổi.
   useEffect(() => {
     let cancelled = false;
-    const task = pdfjs.getDocument({ data: bytes.slice() });
+    const task = pdfjs.getDocument({ data: bytes.slice(), password: password.current });
+    task.onPassword = (update: (pw: string) => void, reason: number) => {
+      if (cancelled) return;
+      setAskPw({
+        retry: reason === pdfjs.PasswordResponses.INCORRECT_PASSWORD,
+        answer: (pw) => {
+          setAskPw(null);
+          if (pw === null) { void task.destroy(); setError('Tệp PDF này được bảo vệ bằng mật khẩu. Hãy mở lại và nhập mật khẩu để xem.'); return; }
+          password.current = pw;
+          update(pw);
+        },
+      });
+    };
     task.promise
       .then(async (d) => {
         const s: Size[] = [];
@@ -269,8 +289,13 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
           const vp = (await d.getPage(i)).getViewport({ scale: 1 });
           s.push({ w: vp.width, h: vp.height });
         }
-        const form = await readFields(d).catch(() => ({ fields: [] as Field[], values: {} as FieldValues }));
+        const isLocked = !!password.current;
+        const form = isLocked ? { fields: [] as Field[], values: {} as FieldValues } : await readFields(d).catch(() => ({ fields: [] as Field[], values: {} as FieldValues }));
+        const ol = await readOutline(d as unknown as Parameters<typeof readOutline>[0]).catch(() => [] as OutlineItem[]);
         if (cancelled) return d.destroy();
+        setLocked(isLocked);
+        setOutline(ol);
+        if (isLocked) setTool('select');
         setFields(form.fields);
         setFormInit(form.values);
         if (!fitted.current) {
@@ -336,8 +361,52 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
       setBytes(out);
     });
 
+  const draft = useDraftAutosave({
+    file, name: file.name, path, dirty, deps: [bytes, annots, formEdits],
+    snapshot: () => applyAnnotations(bytes, annots, undefined, formEdits),
+  });
+
+  /** In / xuất PDF: in đúng nội dung sẽ được lưu (kể cả chú thích, chữ ký, ô biểu mẫu đã điền). */
+  const print = () =>
+    run('Đang chuẩn bị in…', async () => {
+      if (!doc) return;
+      let d = doc;
+      let tmp: PDFDocumentProxy | null = null;
+      if (annots.length || Object.keys(formEdits).length) {
+        tmp = await pdfjs.getDocument({ data: await applyAnnotations(bytes, annots, undefined, formEdits) }).promise;
+        d = tmp;
+      }
+      try {
+        const { printContent } = await import('../../lib/print');
+        await printContent(async (root) => {
+          for (let i = 1; i <= d.numPages; i++) {
+            setBusy(`Đang chuẩn bị in… ${i}/${d.numPages}`);
+            const page = await d.getPage(i);
+            const base = page.getViewport({ scale: 1 });
+            // Khoảng 200 dpi, giới hạn số điểm ảnh để không hết bộ nhớ trên điện thoại.
+            const scale = Math.min(200 / 72, Math.sqrt(MAX_CANVAS_PIXELS / (base.width * base.height)));
+            const vp = page.getViewport({ scale });
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.floor(vp.width);
+            canvas.height = Math.floor(vp.height);
+            await page.render({ canvasContext: canvas.getContext('2d')!, viewport: vp, intent: 'print', annotationMode: pdfjs.AnnotationMode.ENABLE }).promise;
+            const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, 'image/jpeg', 0.92));
+            canvas.width = canvas.height = 0;
+            const img = document.createElement('img');
+            img.className = 'print-page';
+            img.alt = `Trang ${i}`;
+            img.src = blob ? URL.createObjectURL(blob) : '';
+            root.appendChild(img);
+          }
+        }, '@page { margin: 0; }');
+      } finally {
+        void tmp?.destroy();
+      }
+    });
+
   const save = (saveAs = false) =>
     run('Đang lưu…', async () => {
+      if (locked) throw new Error('PDF có mật khẩu chỉ xem, tìm và in được; không lưu được thay đổi.');
       const out = await applyAnnotations(bytes, annots, undefined, formEdits);
       const p = await saveFile({ name: file.name, kind: 'pdf', path }, out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer, saveAs);
       if (p) setPath(p);
@@ -399,6 +468,7 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
       const typing = (e.target as HTMLElement).closest('textarea,input');
       const mod = e.ctrlKey || e.metaKey;
       if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); save(); }
+      else if (mod && e.key.toLowerCase() === 'p') { e.preventDefault(); print(); }
       else if (typing) return;
       else if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); }
       else if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); }
@@ -541,14 +611,17 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
       kind="pdf"
       title={file.name}
       dirty={dirty}
+      draft={draft}
       onClose={onClose}
       onSave={() => save()}
       onSaveAs={() => save(true)}
       busy={busy}
       error={error}
       onDismissError={() => setError(null)}
+      readOnly={locked}
       toolbar={
         <>
+          {!locked && (<>
           <ToolButton icon="↶" label="Hoàn tác" onClick={undo} disabled={!history.length} />
           <ToolButton icon="↷" label="Làm lại" onClick={redo} disabled={!future.length} />
           <Sep />
@@ -592,12 +665,21 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
           })()}
           {selected && <ToolButton icon="🗑" label="Xoá" onClick={removeSelected} />}
           <Sep />
+          </>)}
           <ToolButton icon="−" label="Thu nhỏ" onClick={() => zoomTo(zoom / 1.25)} />
           <span className="tb-zoom">{Math.round(zoom * 100)}%</span>
           <ToolButton icon="+" label="Phóng to" onClick={() => zoomTo(zoom * 1.25)} />
           <ToolButton icon="⇔" label="Vừa khung" onClick={() => zoomTo(fitZoom())} />
           <Sep />
-          <ToolButton icon="▤" label="Trang" active={showThumbs} onClick={() => setShowThumbs((v) => !v)} />
+          <ToolButton icon="▤" label="Trang" active={showThumbs && side === 'pages'} onClick={() => {
+            if (showThumbs && side === 'pages') setShowThumbs(false); else { setSide('pages'); setShowThumbs(true); }
+          }} />
+          {outline.length > 0 && (
+            <ToolButton icon="☰" label="Mục lục" active={showThumbs && side === 'outline'} onClick={() => {
+              if (showThumbs && side === 'outline') setShowThumbs(false); else { setSide('outline'); setShowThumbs(true); }
+            }} />
+          )}
+          {!locked && (<>
           <ToolButton icon="⎘" label="Trích trang" onClick={extract} />
           <ToolButton icon="⊕" label="Gộp PDF" onClick={() => run('Đang gộp…', async () => {
             const other = await pickFile();
@@ -605,6 +687,8 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
             if (other.kind !== 'pdf') throw new Error('Hãy chọn một tệp PDF để gộp.');
             await pageOp('Đang gộp…', (b) => mergePdf(b, new Uint8Array(other.data)));
           })} />
+          </>)}
+          <ToolButton icon="⎙" label="In / PDF" onClick={print} disabled={!doc} />
           <form className="tb-search" onSubmit={(e) => { e.preventDefault(); search(); }}>
             <input placeholder="Tìm trong PDF…" value={query} onChange={(e) => setQuery(e.target.value)} />
             {hits && (hits.length ? (
@@ -617,10 +701,22 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
           </form>
         </>
       }
-      status={`${sizes.length} trang${fields.length ? ` · ${new Set(fields.map((f) => f.name)).size} ô biểu mẫu (bấm vào ô để điền)` : ''} · ${hint ?? ''}`}
+      status={locked ? `${sizes.length} trang · PDF có mật khẩu: chỉ xem, tìm và in` : `${sizes.length} trang${fields.length ? ` · ${new Set(fields.map((f) => f.name)).size} ô biểu mẫu (bấm vào ô để điền)` : ''} · ${hint ?? ''}`}
     >
       <div className="pdf-body">
-        {showThumbs && doc && (
+        {showThumbs && doc && side === 'outline' && outline.length > 0 && (
+          <nav className="pdf-outline" aria-label="Mục lục">
+            {outline.map((o, k) => (
+              <button key={k} style={{ paddingLeft: 10 + o.depth * 14 }} disabled={o.page === null}
+                className={o.page !== null && o.page === curPage ? 'cur' : ''}
+                onClick={() => { if (o.page !== null) { scrollToPage(o.page); if (window.innerWidth <= 700) setShowThumbs(false); } }}>
+                <span className="ol-title">{o.title}</span>
+                {o.page !== null && <span className="ol-page">{o.page + 1}</span>}
+              </button>
+            ))}
+          </nav>
+        )}
+        {showThumbs && doc && side === 'pages' && (
           <aside className="pdf-thumbs">
             {sizes.map((s, i) => (
               <div key={i} className="thumb">
@@ -629,6 +725,7 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
                 </button>
                 <div className="thumb-actions">
                   <span>{i + 1}</span>
+                  {!locked && (<>
                   <button title="Xoay trái" onClick={() => pageOp('Đang xoay…', (b) => rotatePage(b, i, -90))}>⟲</button>
                   <button title="Xoay phải" onClick={() => pageOp('Đang xoay…', (b) => rotatePage(b, i, 90))}>⟳</button>
                   <button title="Lên" disabled={i === 0} onClick={() => pageOp('Đang di chuyển…', (b) => movePage(b, i, i - 1))}>↑</button>
@@ -637,6 +734,7 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
                   <button title="Xoá trang" onClick={() => {
                     if (confirm(`Xoá trang ${i + 1}?`)) pageOp('Đang xoá…', (b) => deletePage(b, i));
                   }}>✕</button>
+                  </>)}
                 </div>
               </div>
             ))}
@@ -689,6 +787,22 @@ export default function PdfEditor({ file, onClose }: { file: OpenedFile; onClose
           </div>
         )}
       </div>
+      {askPw && (
+        <div className="modal-backdrop">
+          <form className="modal pw-dialog" role="dialog" aria-modal="true" aria-labelledby="pw-title" onSubmit={(e) => {
+            e.preventDefault();
+            askPw.answer(String(new FormData(e.currentTarget).get('pw') ?? ''));
+          }}>
+            <h3 id="pw-title">🔒 PDF được bảo vệ bằng mật khẩu</h3>
+            <p className="muted">{askPw.retry ? 'Mật khẩu chưa đúng, hãy thử lại.' : `Nhập mật khẩu để mở “${file.name}”.`}</p>
+            <input name="pw" type="password" autoFocus autoComplete="off" aria-label="Mật khẩu" className="pw-input" />
+            <div className="modal-actions" style={{ justifyContent: 'flex-end' }}>
+              <button type="button" className="btn" onClick={() => askPw.answer(null)}>Huỷ</button>
+              <button type="submit" className="btn primary">Mở</button>
+            </div>
+          </form>
+        </div>
+      )}
       {showSign && (
         <SignaturePad
           onCancel={() => setShowSign(false)}

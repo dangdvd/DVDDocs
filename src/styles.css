@@ -288,3 +288,43 @@ textarea.form-field { padding-top: 1px; line-height: 1.2; }
 .xl-fpop .modal-actions, .xl-cfdlg .modal-actions { flex-wrap: wrap; }
 .annot-text textarea.font-serif { font-family: 'DejaVu Serif', 'Times New Roman', serif; }
 .annot-text textarea.font-mono { font-family: 'DejaVu Sans Mono', 'Courier New', monospace; }
+
+/* ---------- Bản nháp, lỗi, phím tắt, mật khẩu, mục lục PDF, in ---------- */
+.small { font-size: .85rem; }
+.drafts .recent { border-color: #f0c36d; }
+.drafts h2 { color: #9a6700; }
+.help-btn { font-weight: 700; font-size: 1rem; width: 32px; height: 32px; border: 1px solid var(--border); border-radius: 50%; padding: 0; }
+.readonly-tag { font-size: .8rem; padding: 4px 10px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
+.shortcuts table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: .9rem; }
+.shortcuts td { padding: 5px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.shortcuts td:first-child { white-space: nowrap; width: 1%; }
+kbd { font-family: inherit; font-size: .82rem; background: var(--bg); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 5px; padding: 1px 6px; }
+.shortcuts { max-height: calc(100vh - 32px); overflow: auto; }
+.pw-input { width: 100%; padding: 10px 12px; font: inherit; border: 1px solid var(--border); border-radius: 8px; margin: 8px 0 14px; background: var(--bg); color: var(--text); }
+.crash { min-height: 100%; display: grid; place-items: center; padding: 16px; }
+.crash-card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 22px; width: min(620px, 100%); box-shadow: var(--page-shadow); }
+.crash-card h1 { margin: 0 0 8px; font-size: 1.3rem; color: var(--danger); }
+.crash-card .modal-actions { flex-wrap: wrap; margin: 14px 0; }
+.crash-card pre { white-space: pre-wrap; font-size: .75rem; max-height: 240px; overflow: auto; background: var(--bg); padding: 8px; border-radius: 8px; }
+.pdf-outline { width: 260px; flex-shrink: 0; overflow: auto; background: var(--panel); border-right: 1px solid var(--border); padding: 6px 0; }
+.pdf-outline button { display: flex; width: 100%; gap: 8px; align-items: baseline; border: 0; background: none; text-align: left; padding: 6px 10px; cursor: pointer; font-size: .88rem; line-height: 1.3; }
+.pdf-outline button:hover:not(:disabled) { background: var(--accent-soft); }
+.pdf-outline button.cur { color: var(--accent); font-weight: 600; }
+.pdf-outline button:disabled { opacity: .55; cursor: default; }
+.pdf-outline .ol-title { flex: 1; min-width: 0; }
+.pdf-outline .ol-page { color: var(--muted); font-size: .78rem; }
+@media (max-width: 700px) { .pdf-outline { position: absolute; z-index: 5; height: 100%; box-shadow: var(--page-shadow); width: min(300px, 85vw); } }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+#print-root { display: none; }
+@media print {
+  body.printing #root { display: none !important; }
+  body.printing #print-root { display: block; }
+  body.printing { background: #fff; }
+  #print-root .print-page { display: block; width: 100%; height: auto; page-break-after: always; break-after: page; }
+  #print-root .print-page:last-child { page-break-after: auto; break-after: auto; }
+  #print-root .print-sheet-title { font: 600 12pt Calibri, Arial, sans-serif; margin-bottom: 6px; color: #000; }
+  #print-root .print-sheet { border-collapse: collapse; table-layout: fixed; font: 10pt Calibri, Arial, sans-serif; color: #000; }
+  #print-root .print-sheet td { padding: 1px 4px; overflow: hidden; white-space: nowrap; vertical-align: bottom; border: .5px solid #d0d0d0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  #print-root .print-sheet tr { page-break-inside: avoid; break-inside: avoid; }
+}

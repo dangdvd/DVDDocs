@@ -21,6 +21,49 @@ function toArrayBuffer(buf) {
   return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
 }
 
+const SUPPORTED = /\.(pdf|docx|xlsx|csv|tsv)$/i;
+/** Tệp chờ mở: do nhấp đúp / "Mở bằng" trước khi giao diện sẵn sàng. */
+let pendingPath = null;
+let mainWindow = null;
+
+/** Lấy đường dẫn tệp tài liệu từ tham số dòng lệnh (Windows, Linux truyền tệp theo cách này). */
+function fileFromArgv(argv) {
+  return argv.slice(1).find((a) => !a.startsWith('-') && SUPPORTED.test(a)) ?? null;
+}
+
+async function readDoc(p) {
+  const buf = await fs.readFile(p);
+  return { name: path.basename(p), path: p, data: toArrayBuffer(buf) };
+}
+
+/** Gửi tệp sang giao diện đang chạy; nếu chưa có cửa sổ thì giữ lại để giao diện hỏi khi khởi động. */
+async function openInApp(p) {
+  if (!p) return;
+  if (!mainWindow || mainWindow.webContents.isLoading()) { pendingPath = p; return; }
+  try {
+    mainWindow.webContents.send('dvd:open-file', await readDoc(p));
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  } catch (e) {
+    dialog.showErrorBox('Không mở được tệp', `${p}\n${e.message}`);
+  }
+}
+
+// Chỉ chạy một phiên ứng dụng: mở thêm tệp thì gửi sang cửa sổ đang có.
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  pendingPath = fileFromArgv(process.argv);
+  app.on('second-instance', (_e, argv) => openInApp(fileFromArgv(argv)));
+}
+// macOS: mở tệp từ Finder / kéo vào biểu tượng Dock (có thể đến trước khi ứng dụng sẵn sàng).
+app.on('open-file', (e, p) => {
+  e.preventDefault();
+  if (app.isReady()) openInApp(p);
+  else pendingPath = p;
+});
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1280,
@@ -34,6 +77,21 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: true,
     },
+  });
+  mainWindow = win;
+  win.on('closed', () => { if (mainWindow === win) mainWindow = null; });
+  // Còn thay đổi chưa lưu (giao diện chặn beforeunload): hỏi người dùng trước khi đóng cửa sổ.
+  win.webContents.on('will-prevent-unload', (event) => {
+    const choice = dialog.showMessageBoxSync(win, {
+      type: 'warning',
+      buttons: ['Đóng không lưu', 'Quay lại'],
+      defaultId: 1,
+      cancelId: 1,
+      title: 'DVDDocs',
+      message: 'Tài liệu có thay đổi chưa lưu.',
+      detail: 'Nếu đóng bây giờ, thay đổi vẫn được giữ thành bản nháp và có thể khôi phục ở trang chủ lần mở sau.',
+    });
+    if (choice === 0) event.preventDefault();
   });
   // Liên kết ngoài mở bằng trình duyệt hệ thống, không mở trong ứng dụng.
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -54,6 +112,18 @@ ipcMain.handle('dvd:open', async (event) => {
   return { name: path.basename(p), path: p, data: toArrayBuffer(buf) };
 });
 
+ipcMain.handle('dvd:launch-file', async () => {
+  const p = pendingPath;
+  pendingPath = null;
+  if (!p) return null;
+  try {
+    return await readDoc(p);
+  } catch (e) {
+    dialog.showErrorBox('Không mở được tệp', `${p}\n${e.message}`);
+    return null;
+  }
+});
+
 ipcMain.handle('dvd:save', async (event, { name, path: filePath, data, saveAs }) => {
   let target = filePath;
   if (!target || saveAs) {
@@ -71,6 +141,7 @@ ipcMain.handle('dvd:save', async (event, { name, path: filePath, data, saveAs })
 });
 
 app.whenReady().then(() => {
+  if (!gotLock) return;
   protocol.handle('app', (req) => {
     const rel = decodeURIComponent(new URL(req.url).pathname).replace(/^\/+/, '');
     const file = path.normalize(path.join(DIST, rel || 'index.html'));

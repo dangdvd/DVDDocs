@@ -17,6 +17,7 @@ import Subscript from '@tiptap/extension-subscript';
 import Superscript from '@tiptap/extension-superscript';
 import JSZip from 'jszip';
 import { OpenedFile, saveFile } from '../../lib/fileio';
+import { useDraftAutosave } from '../../lib/drafts';
 import { EditorShell, Sep, ToolButton } from '../../components/EditorShell';
 import { exportDocx, PageSetup, PMNode } from './docxExport';
 import { FontSize, LineHeight, PageBreak, SearchHighlight, TableOfContents, cellBackground, findInDoc, searchKey } from './extensions';
@@ -104,7 +105,7 @@ async function readPageSetup(data: ArrayBuffer): Promise<PageSetup> {
 export default function DocxEditor({ file, onClose }: { file: OpenedFile; onClose: () => void }) {
   const isNew = file.data.byteLength === 0;
   const [mode, setMode] = useState<'edit' | 'original'>('edit');
-  const [dirty, setDirty] = useState(false);
+  const [dirty, setDirty] = useState(!!file.restored);
   const [busy, setBusy] = useState<string | null>(isNew ? null : 'Đang mở…');
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -170,11 +171,14 @@ export default function DocxEditor({ file, onClose }: { file: OpenedFile; onClos
       .catch((e) => setError(`Không hiển thị được bố cục gốc: ${e.message ?? e}`));
   }, [mode]);
 
+  const exportCurrent = () => (editor ? exportDocx(editor.getJSON() as PMNode, { ...setup, track: !!trackKey.getState(editor.state)?.on }) : null);
+  const draft = useDraftAutosave({ file, name, path, dirty, snapshot: () => (busy === 'Đang mở…' ? null : exportCurrent()), deps: [editor?.state.doc, setup] });
+
   const save = async (saveAs = false) => {
     if (!editor) return;
     setBusy('Đang lưu…');
     try {
-      const out = await exportDocx(editor.getJSON() as PMNode, { ...setup, track: !!trackKey.getState(editor.state)?.on });
+      const out = (await exportCurrent())!;
       const finalName = name.toLowerCase().endsWith('.docx') ? name : `${name}.docx`;
       const p = await saveFile({ name: finalName, kind: 'docx', path }, out, saveAs || (isNew && !path));
       if (p) { setPath(p); setName(p.split(/[\\/]/).pop() ?? finalName); }
@@ -249,6 +253,7 @@ export default function DocxEditor({ file, onClose }: { file: OpenedFile; onClos
       kind="docx"
       title={name}
       dirty={dirty}
+      draft={draft}
       onClose={onClose}
       onSave={() => save()}
       onSaveAs={() => save(true)}

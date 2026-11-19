@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { OpenedFile, saveFile } from '../../lib/fileio';
+import { useDraftAutosave } from '../../lib/drafts';
+import { printArea, sheetToHtml } from './printSheet';
 import { EditorShell, Sep, ToolButton } from '../../components/EditorShell';
 import { uid } from '../../lib/uid';
 import {
@@ -51,7 +53,7 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
   const [editing, setEditing] = useState<{ text: string; inBar: boolean } | null>(null);
   const [history, setHistory] = useState<Book[]>([]);
   const [future, setFuture] = useState<Book[]>([]);
-  const [dirty, setDirty] = useState(false);
+  const [dirty, setDirty] = useState(!!file.restored);
   const [busy, setBusy] = useState<string | null>(isNew ? null : 'Đang mở…');
   const [error, setError] = useState<string | null>(null);
   const isCsv = /\.(csv|tsv)$/i.test(file.name);
@@ -528,6 +530,11 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
   };
   const activeChart = sheet?.charts?.find((c) => c.id === selChart);
 
+  const draft = useDraftAutosave({
+    file, name, path, dirty, deps: [book],
+    snapshot: () => (book && engine ? saveXlsx(book, loaded.current, (si, r, c) => engine.evaluate(si, r, c)) : null),
+  });
+
   const save = async (saveAs = false) => {
     if (!book || !engine) return;
     setBusy('Đang lưu…');
@@ -588,6 +595,17 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
     return { masters, covered };
   }, [sheet?.merges]);
 
+  /** In / xuất PDF: vùng chọn (nếu chọn nhiều ô) hoặc cả vùng có dữ liệu của trang tính. */
+  const print = async () => {
+    if (!sheet || !engine) return;
+    const n = norm(sel);
+    const area = printArea(sheet, { r0: n.r0, c0: n.c0, r1: n.r1, c1: n.c1 });
+    if (!area) { setNotice('Trang tính trống, không có gì để in.'); return; }
+    const { printContent } = await import('../../lib/print');
+    const html = sheetToHtml(sheet, engine, active, area, { hidden, look: cfLook ?? undefined, defaultWidth: DEFAULT_W, title: book!.sheets.length > 1 ? sheet.name : undefined });
+    await printContent((root) => { root.insertAdjacentHTML('beforeend', html); }, '@page { margin: 12mm; }');
+  };
+
   // Thông báo về tệp CSV chỉ hiện tới khi người dùng bắt đầu thao tác.
   useEffect(() => { setNotice((n) => (n?.startsWith('Tệp CSV') ? null : n)); }, [sel]);
 
@@ -633,6 +651,7 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
       if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); save(); }
+      if (mod && e.key.toLowerCase() === 'p') { e.preventDefault(); void print(); }
       if (mod && (e.key.toLowerCase() === 'f' || e.key.toLowerCase() === 'h')) {
         e.preventDefault();
         setFind((f) => ({ q: f?.q ?? '', repl: f?.repl ?? '', idx: 0, replace: e.key.toLowerCase() === 'h' || !!f?.replace }));
@@ -791,6 +810,7 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
       kind="xlsx"
       title={name}
       dirty={dirty}
+      draft={draft}
       onClose={onClose}
       onSave={() => save()}
       onSaveAs={() => save(true)}
@@ -854,6 +874,8 @@ export default function XlsxEditor({ file, onClose }: { file: OpenedFile; onClos
           <ToolButton icon="−≡" label="Xoá hàng" onClick={() => shift('row', -1)} />
           <ToolButton icon="+‖" label="Chèn cột" onClick={() => shift('col', 1)} />
           <ToolButton icon="−‖" label="Xoá cột" onClick={() => shift('col', -1)} />
+          <Sep />
+          <ToolButton icon="⎙" label="In / PDF" onClick={() => void print()} />
         </>
       }
       status={notice || stats || `${sheet.name} · ${addr(sel.r, sel.c)}${sheet.freeze ? ` · Cố định ${FR} hàng, ${FC} cột` : ''}`}

@@ -14,7 +14,7 @@ Mọi tệp được xử lý ngay trên thiết bị, không tải lên máy ch
 **Tải bản cài đặt dùng thử:** xem mục [Releases](https://github.com/dangdvd/DVDDocs/releases) (Windows, macOS, Linux, Android APK, iPhone IPA chưa ký, Web).
 Để phát hành bản mới: tăng `version` trong `package.json` và merge vào `main`; quy trình `.github/workflows/release.yml` tự build và tạo Release `vX.Y.Z`.
 
-## Tính năng (bản 0.4)
+## Tính năng (bản 0.5)
 
 **PDF**
 - Xem nhiều trang, phóng to/thu nhỏ (chụm hai ngón), vừa khung, đi tới trang; tìm chữ và tô sáng từng kết quả, chuyển qua lại giữa các kết quả.
@@ -23,6 +23,9 @@ Mọi tệp được xử lý ngay trên thiết bị, không tải lên máy ch
 - Thêm chữ (hỗ trợ đầy đủ tiếng Việt, phông được nhúng vào tệp), tô sáng, vẽ khung, che trắng nội dung cũ, bút vẽ tự do.
 - Ký tên bằng tay (chuột/ngón tay/bút) và chèn ảnh; kéo để di chuyển, kéo góc để đổi cỡ.
 - Quản lý trang: xoay, sắp xếp lại, chèn trang trắng, xoá trang, gộp thêm PDF khác, **trích các trang chọn ra tệp mới** (ví dụ `1-3, 5`).
+- **Mở PDF có mật khẩu** (ví dụ sao kê ngân hàng): hỏi mật khẩu, báo khi nhập sai; tài liệu mở ở chế độ chỉ đọc (xem, tìm, in).
+- **Mục lục (bookmark)** của PDF: danh sách nhiều cấp ở thanh bên, bấm để tới trang, tô đậm mục của trang đang xem.
+- **In / xuất PDF** (Ctrl+P): in đúng nội dung sẽ lưu, gồm chú thích, chữ ký và ô biểu mẫu đã điền.
 - Hoàn tác / làm lại; khi lưu, chú thích được ghi thẳng vào nội dung PDF.
 
 **Word (.docx)**
@@ -46,9 +49,16 @@ Mọi tệp được xử lý ngay trên thiết bị, không tải lên máy ch
 - **Mở tệp CSV/TSV** (tự nhận dấu phân cách, bảng mã, số kiểu Việt Nam 1.234,5; giữ số 0 ở đầu mã/số điện thoại), lưu thành .xlsx.
 - **Biểu đồ**: cột, thanh ngang, đường, vùng, tròn, tạo từ vùng chọn (tự nhận hàng tiêu đề và cột nhãn), kéo để di chuyển, kéo góc để đổi cỡ, đổi loại và tiêu đề; lưu thành biểu đồ Excel thật và đọc lại biểu đồ có sẵn trong tệp; biểu đồ có sẵn không bị sửa thì **giữ nguyên màu sắc và kiểu riêng** (chỉ cập nhật số liệu).
 - Chèn/xoá hàng cột (tự dịch công thức và vùng gộp), sắp xếp, tự động tính tổng, Ctrl+D / Ctrl+R điền nhanh, sao chép/dán với Excel và Google Sheets.
+- **In / xuất PDF** (Ctrl+P): in vùng chọn hoặc toàn bộ vùng có dữ liệu, giữ định dạng số, màu, kẻ khung, ô gộp, định dạng có điều kiện; bỏ qua hàng bị ẩn/lọc.
 - Khi lưu, giữ nguyên các phần của workbook gốc mà ứng dụng không chỉnh sửa.
 
-**Chung:** mở tệp gần đây (lưu cục bộ), tạo tài liệu trống, kéo thả tệp, giao diện tối/sáng, phím tắt Ctrl/Cmd+S, Z, Y.
+**Chung**
+- **Tự động lưu bản nháp và khôi phục**: khi có thay đổi chưa lưu, bản nháp được ghi trên thiết bị vài giây một lần và ngay khi ứng dụng xuống nền. Nếu ứng dụng bị đóng đột ngột, hết pin, trình duyệt tải lại hoặc iOS tắt ứng dụng, trang chủ hiện mục **Khôi phục tài liệu chưa lưu**. Lưu tệp hoặc chọn "đóng và bỏ thay đổi" thì bản nháp tự xoá.
+- **Hỏi trước khi đóng** cửa sổ / thẻ trình duyệt khi còn thay đổi chưa lưu.
+- **Màn hình báo lỗi thân thiện** thay vì trang trắng nếu trình soạn thảo gặp lỗi, có nút về trang chủ, tải lại và sao chép chi tiết lỗi.
+- **Bảng phím tắt** (F1 hoặc Ctrl+/, nút "?" trên thanh tiêu đề).
+- **Bản máy tính**: mở tệp bằng nhấp đúp / "Mở bằng DVDDocs" / kéo vào biểu tượng ứng dụng; chỉ chạy một cửa sổ, tệp mở thêm được chuyển vào cửa sổ đang có.
+- Mở tệp gần đây (lưu cục bộ), tạo tài liệu trống, kéo thả tệp, giao diện tối/sáng, phím tắt Ctrl/Cmd+S, Z, Y.
 
 ## Kiến trúc
 
@@ -57,6 +67,8 @@ src/
   App.tsx                 Màn hình chính: mở tệp, tạo mới, tệp gần đây
   lib/fileio.ts           Mở/lưu tệp theo nền tảng (Electron, Capacitor, trình duyệt)
   lib/recent.ts           Danh sách tệp gần đây trong IndexedDB
+  lib/drafts.ts           Tự động lưu bản nháp và khôi phục
+  lib/print.ts            In / xuất PDF qua hộp thoại in của hệ thống
   components/EditorShell  Khung chung: thanh tiêu đề, thanh công cụ, thanh trạng thái
   editors/pdf/            pdf.js (hiển thị) + pdf-lib (chỉnh sửa, ghi tệp)
   editors/docx/           mammoth (đọc) + TipTap (soạn thảo) + docx (ghi) + docx-preview (bố cục gốc)
@@ -83,6 +95,8 @@ npm run desktop      # chạy bản máy tính
 
 - Word: chế độ soạn thảo chưa giữ bố cục nhiều cột, hộp văn bản, đầu/chân trang khác nhau cho trang đầu hoặc trang chẵn/lẻ (chỉ sửa đầu/chân trang mặc định); các phần này vẫn xem được ở chế độ Bố cục gốc. Theo dõi thay đổi chưa ghi lại thay đổi định dạng và việc nối/tách đoạn. Chưa có chú thích (comment).
 - Excel: định dạng có điều kiện dạng công thức, bộ biểu tượng, top 10 được giữ nguyên khi lưu nhưng chưa hiển thị; lọc theo điều kiện số/ngày của Excel được giữ hàng ẩn nhưng chưa sửa được. Viền được đơn giản hoá thành nét mảnh khi kẻ mới. Biểu đồ phân tán, radar được lưu thành biểu đồ đường nếu bị sửa.
+- PDF có mật khẩu chỉ xem, tìm và in được, chưa sửa và lưu được (thư viện ghi PDF không giải mã được nội dung).
+- Excel: bản in chưa gồm biểu đồ.
 - PDF: phông khi sửa chữ là họ DejaVu gần giống phông gốc, không phải chính phông gốc (phông nhúng trong PDF thường chỉ chứa những chữ đã dùng nên không thể gõ chữ mới bằng nó). Chữ nằm nghiêng hoặc nằm trong nhóm đồ hoạ (form XObject) chỉ được che, không xoá được khỏi tệp.
 - **Chưa hỗ trợ và lý do:**
   - Tệp .doc/.xls/.ppt đời cũ (định dạng nhị phân trước 2007): thư viện đọc miễn phí còn lỗ hổng bảo mật chưa vá; hãy mở bằng Word/Excel hoặc LibreOffice rồi lưu thành .docx/.xlsx. Tệp CSV thì mở được trực tiếp.
